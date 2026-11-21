@@ -1,9 +1,13 @@
+import gc
 import hashlib
 import json
+import os
 import socket
 import sqlite3
 import subprocess
 import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from datetime import datetime, timezone
 from importlib.metadata import version
@@ -11,7 +15,7 @@ from pathlib import Path
 
 import pytest
 
-from stepcache import Blob, Refused, Step, StepCache, Version
+from stepcache import Blob, Refused, SqliteStore, Step, StepCache, Version
 
 
 @pytest.fixture
@@ -257,3 +261,50 @@ def test_stepcache_imports_without_installed_metadata():
     # -S drops site-packages, so the installed package's metadata is not found.
     code = f'import sys; sys.path.insert(0, {src!r}); import stepcache'
     assert subprocess.run([sys.executable, '-I', '-S', '-c', code]).returncode == 0
+
+
+@pytest.mark.skipif(os.name != 'posix', reason='needs os.fork')
+def test_a_forked_child_keeps_its_result_after_the_parent_closes_the_store(tmp_path):
+    def open_cache():
+        return StepCache(SqliteStore(tmp_path / 'stepcache.db', files=tmp_path / 'blobs'))
+
+    step = Step('s', Version.of(), lambda inputs: {'png': Blob(f'png {inputs["x"]}'.encode())})
+    cache = open_cache()
+    cache.run(step, {'x': 1})
+    parent_closed, notify = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        os.read(parent_closed, 1)
+        code = 1
+        try:
+            cache.run(step, {'x': 2})
+            code = 0
+        finally:
+            os._exit(code)
+    # The parent's last connection checkpoints and deletes the WAL as it closes, so a child
+    # still writing through that inherited connection would lose its result. A connection is
+    # in a reference cycle, so only the collector closes it.
+    del cache
+    gc.collect()
+    os.write(notify, b'x')
+    os.close(parent_closed)
+    os.close(notify)
+    _, status = os.waitpid(pid, 0)
+    assert os.waitstatus_to_exitcode(status) == 0
+    assert open_cache().run(step, {'x': 2}).hit
+
+
+def test_threads_sharing_a_cache_run_overlapping_inputs(cache):
+    n = 8
+    step = Step('s', Version.of(), lambda inputs: {'png': Blob(f'png {inputs["x"]}'.encode())})
+    barrier = threading.Barrier(n)
+
+    def worker(i):
+        barrier.wait()
+        for x in range(10):
+            cache.run(step, {'x': (x + i) % 10})
+
+    with ThreadPoolExecutor(n) as pool:
+        for future in [pool.submit(worker, i) for i in range(n)]:
+            future.result()
+    assert all(cache.run(step, {'x': x}).hit for x in range(10))
