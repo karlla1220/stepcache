@@ -162,6 +162,14 @@ def test_a_claim_has_one_owner_until_the_owner_releases_it(store):
     assert store.owner_alive(owner) and store.owner_alive(other.claim_owner('k'))
 
 
+def test_store_objects_on_one_db_in_one_process_share_one_lock_file(store):
+    stores = [SqliteStore(store.path, files=store.files) for _ in range(50)]
+    for i, s in enumerate(stores):
+        assert s.claim(f'k{i}')
+    assert len({store.claim_owner(f'k{i}') for i in range(50)}) == 1
+    assert len(list(store.path.with_name(f'{store.path.name}.locks').iterdir())) == 1
+
+
 def test_an_owner_that_is_not_a_lock_file_name_is_dead_and_its_path_is_left_alone(store):
     victim = store.path.parent / 'notes.txt'
     victim.write_text('keep me')
