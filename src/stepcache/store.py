@@ -1,3 +1,5 @@
+import atexit
+import fcntl
 import hashlib
 import json
 import os
@@ -53,6 +55,28 @@ _SCHEMA = [
 
 # Connections inherited across fork. SQLite must not touch them in the child, not even to close.
 _inherited = []
+
+_held_locks: dict[int, Path] = {}
+_held_locks_guard = threading.Lock()
+
+
+def _drop_inherited_locks():
+    # An inherited descriptor shares the parent's lock, so a child that never touches stepcache
+    # would keep a dead parent's claims looking alive. Closing it leaves the parent's lock held.
+    global _held_locks_guard
+    _held_locks_guard = threading.Lock()
+    for fd in _held_locks:
+        os.close(fd)
+    _held_locks.clear()
+
+
+os.register_at_fork(after_in_child=_drop_inherited_locks)
+
+
+@atexit.register
+def _remove_held_locks():
+    for path in _held_locks.values():
+        path.unlink(missing_ok=True)
 
 
 class SchemaMismatch(Exception):
@@ -120,12 +144,17 @@ class SqliteStore:
 
     Blobs up to INLINE_BLOB_MAX bytes live in the database, larger ones in
     `files/<sha[:2]>/<sha[2:]>`. Processes on the same machine may share the store.
+
+    A claim names its owner by a lock file in `<db file name>.locks/` that the claiming process
+    holds with `flock` until it exits. An owner whose file is gone or can be locked is dead.
     """
 
     def __init__(self, path, files):
         self.path = Path(path)
         self.files = Path(files)
+        self._locks = self.path.with_name(f'{self.path.name}.locks')
         self._local = threading.local()
+        self._lock: tuple[int, str] | None = None
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._write() as c:
             version = _schema_version(c, self.path)
@@ -238,6 +267,67 @@ class SqliteStore:
         with self._write() as c:
             c.execute('DELETE FROM blobs WHERE sha = ?', (sha,))
         self._blob_path(sha).unlink(missing_ok=True)
+
+    def claim(self, key: str) -> bool:
+        """Claim `key` for this process unless it is claimed, and say whether this call claimed it."""
+        owner = self._owner()
+        with self._write() as c:
+            return c.execute(
+                'INSERT INTO claims (key, owner) VALUES (?, ?) ON CONFLICT (key) DO NOTHING', (key, owner)
+            ).rowcount == 1
+
+    def claim_owner(self, key: str) -> str | None:
+        row = self._conn().execute('SELECT owner FROM claims WHERE key = ?', (key,)).fetchone()
+        return None if row is None else row[0]
+
+    def owner_alive(self, owner: str) -> bool:
+        """Whether the process that holds the lock file named `owner` is alive.
+
+        A dead owner's lock file is deleted.
+        """
+        if self._lock == (os.getpid(), owner):
+            return True
+        path = self._locks / owner
+        try:
+            fd = os.open(path, os.O_RDONLY)
+        except FileNotFoundError:
+            return False
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        else:
+            path.unlink(missing_ok=True)
+            return False
+        finally:
+            os.close(fd)
+
+    def take_over(self, key: str, dead_owner: str) -> bool:
+        """Move the claim on `key` from `dead_owner` to this process, and say whether it moved."""
+        owner = self._owner()
+        with self._write() as c:
+            return c.execute(
+                'UPDATE claims SET owner = ? WHERE key = ? AND owner = ?', (owner, key, dead_owner)
+            ).rowcount == 1
+
+    def release(self, key: str):
+        """Delete this process's claim on `key`."""
+        owner = self._owner()
+        with self._write() as c:
+            c.execute('DELETE FROM claims WHERE key = ? AND owner = ?', (key, owner))
+
+    def _owner(self) -> str:
+        """The name of this process's lock file, which the first call creates and locks."""
+        with _held_locks_guard:
+            if self._lock is None or self._lock[0] != os.getpid():
+                self._locks.mkdir(exist_ok=True)
+                name = secrets.token_hex(16)
+                path = self._locks / name
+                fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+                fcntl.flock(fd, fcntl.LOCK_EX)
+                _held_locks[fd] = path
+                self._lock = (os.getpid(), name)
+            return self._lock[1]
 
     def put_version(self, sha: str, components: dict):
         with self._write() as c:
