@@ -323,7 +323,8 @@ class Subject:
                 entry = (step.name, step.version.sha, res.key)
                 failed = res.status == 'error'
                 # A None key cannot tell a retry from another input, so its failure sticks.
-                if entry not in self._entries or failed == (res.key is None):
+                wins = failed if res.key is None else not failed
+                if wins or entry not in self._entries:
                     self._entries[entry] = (res.result_sha, failed)
 
 
