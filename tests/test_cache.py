@@ -1,3 +1,5 @@
+import asyncio
+import functools
 import gc
 import hashlib
 import json
@@ -149,7 +151,12 @@ def test_a_refusal_is_stored_and_not_asked_again(cache):
         assert (res.status, res.outputs, res.refusal) == ('refused', {}, Refused('not a figure', {'page': 3}))
 
 
-def test_an_exception_is_not_stored_and_the_next_run_tries_again(cache):
+@pytest.mark.parametrize(
+    'call',
+    [StepCache.run, lambda cache, step, inputs: asyncio.run(cache.async_run(step, inputs))],
+    ids=['run', 'async_run'],
+)
+def test_an_exception_is_not_stored_and_the_next_run_tries_again(cache, call):
     answers = iter([RuntimeError('model timed out'), {'y': 1}])
 
     def answer(inputs):
@@ -161,8 +168,8 @@ def test_an_exception_is_not_stored_and_the_next_run_tries_again(cache):
     run, calls = counted(answer)
     step = Step('s', Version.of(), run)
     with pytest.raises(RuntimeError):
-        cache.run(step, {'x': 1})
-    res = cache.run(step, {'x': 1})
+        call(cache, step, {'x': 1})
+    res = call(cache, step, {'x': 1})
     assert not res.hit and res.outputs == {'y': 1}
     assert len(calls) == 2
 
@@ -461,3 +468,76 @@ def test_a_waiting_worker_runs_the_step_itself_when_the_owner_raises(cache, monk
     res = waiter.result(10)
     assert not res.hit and res.outputs == {'y': 1}
     assert len(calls) == 2
+
+
+def test_ten_async_runs_of_one_key_run_the_step_once_and_leave_the_loop_free(cache, monkeypatch):
+    monkeypatch.setattr('stepcache.cache.WAIT_SECONDS', 0.2)
+    calls = []
+
+    async def run(inputs):
+        calls.append(inputs)
+        await asyncio.sleep(0.5)
+        return {'alt': Blob(b'alt text')}
+
+    step = Step('vlm', Version.of(), run)
+
+    async def main():
+        ticks = []
+
+        async def tick():
+            while True:
+                ticks.append(time.monotonic())
+                await asyncio.sleep(0.01)
+
+        ticker = asyncio.create_task(tick())
+        results = await asyncio.gather(*(cache.async_run(step, {'x': 1}) for _ in range(10)))
+        ticker.cancel()
+        return results, ticks
+
+    results, ticks = in_thread(asyncio.run, main()).result(10)
+    assert len(calls) == 1
+    assert sorted(r.hit for r in results) == [False] + [True] * 9
+    assert len({r.result_sha for r in results}) == 1
+    assert results[0].outputs['alt'].read() == b'alt text'
+    assert max(b - a for a, b in zip(ticks, ticks[1:])) < 0.1
+
+
+async def answer_async(inputs, scale=1):
+    return {'y': inputs['x'] * scale}
+
+
+@pytest.mark.parametrize(
+    'run, y', [(answer_async, 1), (functools.partial(answer_async, scale=2), 2)], ids=['async-def', 'partial']
+)
+def test_run_refuses_an_async_step_and_async_run_awaits_it(cache, run, y):
+    step = Step('s', Version.of(), run)
+    with pytest.raises(TypeError):
+        cache.run(step, {'x': 1})
+    first = asyncio.run(cache.async_run(step, {'x': 1}))
+    second = asyncio.run(cache.async_run(step, {'x': 1}))
+    assert (first.hit, second.hit) == (False, True)
+    assert first.outputs == second.outputs == {'y': y}
+
+
+def test_async_run_calls_a_sync_step_and_shares_its_records_with_run(cache):
+    run, calls = counted(double)
+    step = Step('s', Version.of(), run)
+    first = asyncio.run(cache.async_run(step, {'x': 2}))
+    second = cache.run(step, {'x': 2})
+    assert (first.hit, second.hit) == (False, True)
+    assert first.outputs == {'y': 4} and first.result_sha == second.result_sha
+    assert len(calls) == 1
+
+
+def test_async_run_awaits_a_cache_false_step_every_time_and_stores_nothing(cache, store):
+    calls = []
+
+    async def run(inputs):
+        calls.append(inputs)
+        return {'outline': Blob(b'outline')}
+
+    step = Step('outline', Version.of(), run, cache=False)
+    results = [asyncio.run(cache.async_run(step, {'x': 1})) for _ in range(2)]
+    assert len(calls) == 2
+    assert [(r.hit, r.key, r.outputs) for r in results] == [(False, None, {'outline': Blob(b'outline')})] * 2
+    assert not store.has(sha(b'outline'))

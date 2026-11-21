@@ -1,3 +1,4 @@
+import asyncio
 import socket
 import time
 from dataclasses import dataclass
@@ -44,6 +45,7 @@ class StepCache:
         stores nothing, and the exception propagates. When another writer stored a result for the
         key first, that result is returned.
         """
+        _check_sync(step)
         if not step.cache:
             return _uncached(step.run(inputs))
         key, encoded_inputs = _key(step, inputs)
@@ -51,6 +53,27 @@ class StepCache:
         if record is not None:
             return self._result(record, hit=True)
         return self._compute(step, key, encoded_inputs, inputs)
+
+    async def async_run(self, step: Step, inputs: dict) -> Result:
+        """`run` for async code. It awaits an async step and calls a sync one directly.
+
+        While another worker computes the same key, this waits without blocking the event loop.
+        """
+        if not step.cache:
+            out = step.run(inputs)
+            return _uncached(await out if step.is_async else out)
+        key, encoded_inputs = _key(step, inputs)
+        record = await _async_wait(self._record_or_claim(key))
+        if record is not None:
+            return self._result(record, hit=True)
+        try:
+            started = time.monotonic()
+            out = step.run(inputs)
+            if step.is_async:
+                out = await out
+            return self._write(step, key, encoded_inputs, out, _ms_since(started))
+        finally:
+            self.store.release(key)
 
     def invalidate(self, step: Step, key: str):
         """Delete the record of `key`, so the next run computes it again."""
@@ -143,6 +166,11 @@ def _key(step: Step, inputs: dict) -> tuple[str, dict]:
     return digest([KEY_FORMAT, step.name, step.version.sha, encoded_inputs]), encoded_inputs
 
 
+def _check_sync(step: Step):
+    if step.is_async:
+        raise TypeError(f'step {step.name!r} is async; call it with async_run')
+
+
 def _wait(protocol):
     while True:
         try:
@@ -150,6 +178,15 @@ def _wait(protocol):
         except StopIteration as done:
             return done.value
         time.sleep(WAIT_SECONDS)
+
+
+async def _async_wait(protocol):
+    while True:
+        try:
+            next(protocol)
+        except StopIteration as done:
+            return done.value
+        await asyncio.sleep(WAIT_SECONDS)
 
 
 def _uncached(out) -> Result:
