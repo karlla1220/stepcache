@@ -1,0 +1,9 @@
+# Internal notes: consumer names, issue numbers, package index, production host.
+internal/
+
+.DS_Store
+.venv/
+__pycache__/
+*.egg-info/
+dist/
+.pytest_cache/
