@@ -922,6 +922,19 @@ def test_a_subject_whose_cache_false_step_failed_in_the_block_is_stale(cache, ca
     assert cache.stale_subjects([vlm, outline], complete=True) == [('B', [Reason('failed', 'outline', {'key': None})])]
 
 
+@pytest.mark.parametrize(
+    'run_batch, bad', [(lambda inputs_list: [{'y': 1}], 2), (None, {1})], ids=['wrong-length-batch', 'input-not-json']
+)
+def test_a_run_many_that_raises_records_a_failure_for_each_inputs_dict(cache, run_batch, bad):
+    step = Step('vlm', Version.of(), double, run_batch=run_batch)
+    with cache.subject('A') as s:
+        with pytest.raises(ValueError):
+            s.run_many(step, [{'x': 1}, {'x': bad}])
+    bad_key = key_of(step, {'x': bad}) if isinstance(bad, int) else None
+    keys = sorted([key_of(step, {'x': 1}), bad_key], key=lambda key: key or '')
+    assert cache.stale_subjects([step]) == [('A', [Reason('failed', 'vlm', {'key': key}) for key in keys])]
+
+
 def test_a_run_whose_inputs_have_no_key_is_a_failure_with_no_key(cache):
     step = Step('vlm', Version.of(), double)
     with cache.subject('A') as s:
