@@ -255,6 +255,8 @@ class Subject:
     `run`, `run_many` and `async_run` return what the `StepCache` methods return, and record
     (step, version_sha, key, result_sha) for each result. A `cache=False` step has no key or
     result_sha, and a `run_many` error has no result_sha. A call that raises records nothing.
+    Each (step, version_sha, key) is recorded once, and a result with a result_sha replaces the
+    recorded one, so an error retried successfully in the block leaves only the good entry.
     When the `with` block ends normally, the recorded entries replace the subject's manifest.
     When it raises, the previous manifest stays.
     """
@@ -263,7 +265,7 @@ class Subject:
         self.cache = cache
         self.name = name
         self.source = source
-        self._entries = set()
+        self._entries = {}
         self._lock = threading.Lock()
 
     def __enter__(self) -> 'Subject':
@@ -271,7 +273,7 @@ class Subject:
 
     def __exit__(self, exc_type, exc, tb):
         if exc_type is None:
-            self.cache.store.put_manifest(self.name, self.source, self._entries)
+            self.cache.store.put_manifest(self.name, self.source, [(*k, v) for k, v in self._entries.items()])
 
     def run(self, step: Step, inputs: dict) -> Result:
         res = self.cache.run(step, inputs)
@@ -293,7 +295,10 @@ class Subject:
             # A cached step's version is stored with its record. This one's is needed to name what changed.
             self.cache.store.put_version(step.version.sha, step.version.components)
         with self._lock:
-            self._entries.update((step.name, step.version.sha, res.key, res.result_sha) for res in results)
+            for res in results:
+                entry = (step.name, step.version.sha, res.key)
+                if res.result_sha is not None or entry not in self._entries:
+                    self._entries[entry] = res.result_sha
 
 
 def _reason(step: Step, kind: str, value: str | None, old: dict | None) -> Reason:
