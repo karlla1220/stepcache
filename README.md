@@ -162,7 +162,10 @@ source.
 - `record`: the stored result is gone, for example after `cache.invalidate(step, key)`, or
   another run stored a different result for the key.
 - `failed`: the step failed in the block that made the manifest. The failure counts even
-  when the block caught the exception and went on.
+  when the block caught the exception and went on. For a cached step, a failure retried
+  successfully in the same block is cleared. Any failure of a `cache=False` step in the
+  block leaves the subject stale, because a step with no key cannot tell a retry from
+  another input.
 - `missing_step`: the manifest has no entry for the step. This kind appears only with
   `complete=True`.
 
@@ -173,6 +176,8 @@ version, so a change of that version makes the subject stale.
 
 Several processes on one machine can share one cache. `SqliteStore(path, files)` keeps the
 records in a SQLite database at `path` and blobs over 256 KiB in the folder `files`.
+Opening a cache made by another schema version raises `SchemaMismatch`, and there is
+no migration yet, so delete that cache and let stepcache build a new one.
 
 On a miss, a process claims the key before it runs the step. Other processes that need the
 same key wait for the result and do not compute it again. Each claim names a lock file that

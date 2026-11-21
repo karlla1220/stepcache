@@ -905,6 +905,20 @@ def test_a_subject_that_caught_a_raised_failure_in_the_block_is_stale(cache, cal
     assert cache.stale_subjects([vlm], complete=True) == [('A', [Reason('failed', 'vlm', {'key': bad})])]
 
 
+def test_an_error_storing_the_version_of_a_failed_run_does_not_hide_the_step_exception(cache, store, monkeypatch):
+    vlm = Step('vlm', Version.of(), fail)
+
+    def put_version_failing(sha, components):
+        raise sqlite3.OperationalError('database is locked')
+
+    with cache.subject('A') as s:
+        monkeypatch.setattr(store, 'put_version', put_version_failing)
+        with pytest.raises(RuntimeError):
+            s.run(vlm, {'x': 1})
+        monkeypatch.undo()
+    assert cache.stale_subjects([vlm]) == [('A', [Reason('failed', 'vlm', {'key': key_of(vlm, {'x': 1})})])]
+
+
 @pytest.mark.parametrize(
     'call',
     [
