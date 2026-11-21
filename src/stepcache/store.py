@@ -170,7 +170,7 @@ WITH pipeline (position, step, version_sha) AS (
     FROM manifest_entries e
     JOIN pipeline p ON p.step = e.step
     LEFT JOIN records r ON r.key = e.key
-    WHERE e.key IS NOT NULL AND NOT e.failed AND (e.result_sha IS NULL OR r.result_sha IS NOT e.result_sha)
+    WHERE e.key IS NOT NULL AND NOT e.failed AND r.result_sha IS NOT e.result_sha
     UNION ALL
     SELECT DISTINCT e.subject, p.position, 2, 'failed', e.step, e.key, NULL
     FROM manifest_entries e
