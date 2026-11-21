@@ -35,7 +35,6 @@ def sha(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-
 def spec_digest(value) -> str:
     text = json.dumps(value, sort_keys=True, separators=(',', ':'), ensure_ascii=False)
     return hashlib.sha256(text.encode()).hexdigest()
