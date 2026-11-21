@@ -416,7 +416,6 @@ class SqliteStore:
         ).fetchall()
         if not rows:
             return None
-        # One query, so a concurrent put_manifest is never half seen. No entries gives one NULL row.
         entries = frozenset(row[2:] for row in rows if row[2] is not None)
         return Manifest(subject, rows[0][0], rows[0][1], entries)
 

@@ -296,7 +296,6 @@ class Subject:
 
     def _add(self, step: Step, results: list[Result]):
         if not step.cache:
-            # A cached step's version is stored with its record. This one's is needed to name what changed.
             self.cache.store.put_version(step.version.sha, step.version.components)
         with self._lock:
             for res in results:
