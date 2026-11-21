@@ -135,7 +135,12 @@ class StepCache:
     def _record_or_claim(self, key: str):
         held = False
         while True:
-            record = self._lookup(key)
+            try:
+                record = self._lookup(key)
+            except BaseException:
+                if held:
+                    self.store.release(key)
+                raise
             if held:
                 if record is not None:
                     self.store.release(key)
