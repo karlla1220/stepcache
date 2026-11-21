@@ -697,3 +697,53 @@ def test_run_many_waits_after_its_batch_for_a_miss_another_worker_holds(cache, m
     assert isinstance(holder.exception(10), RuntimeError) == holder_raises
     assert batches == [[{'x': 2}]] and free.outputs == {'by': 'run_batch'}
     assert (held.hit, held.status, held.outputs, len(run_calls)) == (hit, 'ok', {'by': 'run'}, runs)
+
+
+def manifest(store, subject) -> tuple[str | None, Counter] | None:
+    with closing(sqlite3.connect(store.path)) as c:
+        row = c.execute('SELECT source FROM manifests WHERE subject = ?', (subject,)).fetchone()
+        entries = Counter(c.execute(
+            'SELECT step, version_sha, key, result_sha FROM manifest_entries WHERE subject = ?', (subject,)
+        ))
+    return None if row is None else (row[0], entries)
+
+
+def test_a_subject_records_each_step_version_key_and_result_it_used_once(cache, store):
+    def answer(inputs):
+        if inputs['x'] < 0:
+            raise RuntimeError('model timed out')
+        return Refused('blank page') if inputs['x'] == 0 else double(inputs)
+
+    def run_batch(inputs_list):
+        return [RuntimeError('model timed out') if inputs['x'] < 0 else answer(inputs) for inputs in inputs_list]
+
+    step = Step('ocr', Version.of(), answer)
+    batched = Step('vlm', Version.of(), answer, run_batch=run_batch)
+    outline = Step('outline', Version.of(rev='1'), lambda inputs: {'headings': 2}, cache=False)
+    with cache.subject('A', source='docx sha') as s:
+        ok = s.run(step, {'x': 1})
+        again = s.run(step, {'x': 1})
+        refused = s.run(step, {'x': 0})
+        with pytest.raises(RuntimeError):
+            s.run(step, {'x': -1})
+        done, failed = s.run_many(batched, [{'x': 2}, {'x': -2}])
+        outlined = s.run(outline, {})
+        s.run_many(outline, [{}, {}])
+        awaited = asyncio.run(s.async_run(step, {'x': 3}))
+    assert (ok.outputs, again.hit, refused.status, failed.status) == ({'y': 2}, True, 'refused', 'error')
+    assert (outlined.outputs, awaited.outputs) == ({'headings': 2}, {'y': 6})
+    expected = ('docx sha', Counter([
+        ('ocr', step.version.sha, ok.key, ok.result_sha),
+        ('ocr', step.version.sha, refused.key, refused.result_sha),
+        ('ocr', step.version.sha, awaited.key, awaited.result_sha),
+        ('vlm', batched.version.sha, done.key, done.result_sha),
+        ('vlm', batched.version.sha, failed.key, None),
+        ('outline', outline.version.sha, None, None),
+    ]))
+    assert manifest(store, 'A') == expected
+    assert store.get_version(outline.version.sha) == outline.version.components
+    for subject in ('A', 'B'):
+        with pytest.raises(RuntimeError), cache.subject(subject) as s:
+            s.run(step, {'x': 4})
+            raise RuntimeError('converter crashed')
+    assert (manifest(store, 'A'), manifest(store, 'B')) == (expected, None)

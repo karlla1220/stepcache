@@ -1,5 +1,6 @@
 import asyncio
 import socket
+import threading
 import time
 from dataclasses import dataclass
 from importlib.metadata import PackageNotFoundError, version
@@ -132,6 +133,10 @@ class StepCache:
         """Delete the record of `key`, so the next run computes it again."""
         self.store.delete_record(key)
 
+    def subject(self, name: str, source: str | None = None) -> 'Subject':
+        """Start recording the manifest of the subject `name`. Use the result in a `with` block."""
+        return Subject(self, name, source)
+
     def _record_or_claim(self, key: str):
         held = False
         while True:
@@ -209,6 +214,53 @@ class StepCache:
         }
         refusal = None if record.refusal is None else Refused(**record.refusal)
         return Result(hit, record.status, outputs, refusal, record.key, record.result_sha)
+
+
+class Subject:
+    """The manifest of one subject while it is processed. Threads may share one Subject.
+
+    `run`, `run_many` and `async_run` return what the `StepCache` methods return, and record
+    (step, version_sha, key, result_sha) for each result. A `cache=False` step has no key or
+    result_sha, and a `run_many` error has no result_sha. A call that raises records nothing.
+    When the `with` block ends normally, the recorded entries replace the subject's manifest.
+    When it raises, the previous manifest stays.
+    """
+
+    def __init__(self, cache: StepCache, name: str, source: str | None):
+        self.cache = cache
+        self.name = name
+        self.source = source
+        self._entries = set()
+        self._lock = threading.Lock()
+
+    def __enter__(self) -> 'Subject':
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if exc_type is None:
+            self.cache.store.put_manifest(self.name, self.source, self._entries)
+
+    def run(self, step: Step, inputs: dict) -> Result:
+        res = self.cache.run(step, inputs)
+        self._add(step, [res])
+        return res
+
+    def run_many(self, step: Step, inputs_list: list[dict]) -> list[Result]:
+        results = self.cache.run_many(step, inputs_list)
+        self._add(step, results)
+        return results
+
+    async def async_run(self, step: Step, inputs: dict) -> Result:
+        res = await self.cache.async_run(step, inputs)
+        self._add(step, [res])
+        return res
+
+    def _add(self, step: Step, results: list[Result]):
+        if not step.cache:
+            # A cached step's version is stored with its record. This one's is needed to name what changed.
+            self.cache.store.put_version(step.version.sha, step.version.components)
+        with self._lock:
+            self._entries.update((step.name, step.version.sha, res.key, res.result_sha) for res in results)
 
 
 def _key(step: Step, inputs: dict) -> tuple[str, dict]:
