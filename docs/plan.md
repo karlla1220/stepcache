@@ -101,13 +101,15 @@
 
 - `cache.subject(name, source=)`: `run`, `run_many`, `async_run`. 블록이 정상으로 끝날 때만 매니페스트를 바꾼다.
 - `Step(cache=False)`: 실행만 하고 `(단계, 단계 버전)`을 매니페스트에 남긴다.
-- `cache.stale_subjects(pipeline, complete)`: 이유는 `version`(달라진 구성 요소 포함), `record`, `missing_step`.
+- `cache.stale_subjects(pipeline, complete)`: 이유는 `version`(달라진 구성 요소 포함), `record`, `failed`, `missing_step`.
+- `cache.manifest(subject)`: subject의 최신 매니페스트. 없으면 `None`.
 
 확인:
 
 - 설계 5.2의 예를 그대로 테스트한다. 키 K를 무효화하면 A와 B가 stale이 된다. B를 다시 처리하면 B만 stale에서 빠진다. A를 다시 처리하면 K는 적중하고 단계는 실행되지 않는다.
 - 단계 버전을 바꾸면 그 단계를 쓴 subject가 stale이 되고, 이유에 달라진 구성 요소가 나온다. `cache=False` 단계도 같다.
 - 블록이 예외로 끝나면 이전 매니페스트가 그대로 남는다.
+- 블록 안에서 잡은 실패(`run_many`의 오류, `s.run`·`s.async_run`의 예외)는 `failed`로 나온다. `cache=False` 단계도 같고, 키는 null이다. 같은 블록에서 다시 시도해 성공하면 stale이 아니다.
 - `complete=True`일 때만 매니페스트에 없는 단계가 `missing_step`으로 나온다. `pipeline`에 없는 단계의 항목은 무시된다.
 - 여러 스레드가 한 subject 세션을 같이 써도 항목이 빠지지 않는다.
 

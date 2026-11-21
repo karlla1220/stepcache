@@ -1,7 +1,7 @@
 """Content-addressed cache for multi-step processing pipelines."""
 
-from .cache import Result, StepCache
+from .cache import Reason, Result, StepCache, Subject
 from .step import Blob, Refused, Step, Version
-from .store import SchemaMismatch, SqliteStore
+from .store import Manifest, SchemaMismatch, SqliteStore
 
-__all__ = ['Blob', 'Refused', 'Result', 'SchemaMismatch', 'SqliteStore', 'Step', 'StepCache', 'Version']
+__all__ = ['Blob', 'Manifest', 'Reason', 'Refused', 'Result', 'SchemaMismatch', 'SqliteStore', 'Step', 'StepCache', 'Subject', 'Version']

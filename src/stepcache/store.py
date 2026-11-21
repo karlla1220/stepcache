@@ -13,7 +13,7 @@ from dataclasses import dataclass, fields, replace
 from datetime import datetime, timezone
 from pathlib import Path
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 INLINE_BLOB_MAX = 256 * 1024
 BUSY_TIMEOUT_SECONDS = 60
 
@@ -48,7 +48,8 @@ _SCHEMA = [
         step TEXT NOT NULL,
         version_sha TEXT NOT NULL,
         key TEXT,
-        result_sha TEXT
+        result_sha TEXT,
+        failed INTEGER NOT NULL DEFAULT 0 CHECK (failed IN (0, 1))
     )""",
     'CREATE INDEX manifest_entries_subject ON manifest_entries (subject)',
     'CREATE TABLE claims (key TEXT PRIMARY KEY, owner TEXT NOT NULL)',
@@ -117,6 +118,20 @@ class Record:
     last_used_at: str | None = None
 
 
+@dataclass(frozen=True)
+class Manifest:
+    """The latest manifest of one subject.
+
+    `produced_at` is when it was stored, as an ISO 8601 UTC time. `source` is what the
+    application passed to `subject`. Each entry is (step, version_sha, key, result_sha, failed).
+    """
+
+    subject: str
+    produced_at: str
+    source: str | None
+    entries: frozenset
+
+
 _RECORD_COLUMNS = [f.name for f in fields(Record)]
 _RECORD_JSON = {'inputs', 'outputs', 'refusal', 'producer'}
 _SELECT_RECORD = f'SELECT {", ".join(_RECORD_COLUMNS)} FROM records WHERE key = ?'
@@ -140,6 +155,34 @@ def _record_row(record: Record) -> list:
 
 def _row_record(row) -> Record:
     return Record(*map(_from_column, _RECORD_COLUMNS, row))
+
+
+_STALE = """
+WITH pipeline (position, step, version_sha) AS (
+    SELECT key, json_extract(value, '$[0]'), json_extract(value, '$[1]') FROM json_each(?)
+), reasons (subject, position, kind_order, kind, step, value, components) AS (
+    SELECT DISTINCT e.subject, p.position, 0, 'version', e.step, e.version_sha, v.components
+    FROM manifest_entries e
+    JOIN pipeline p ON p.step = e.step AND p.version_sha != e.version_sha
+    LEFT JOIN versions v ON v.version_sha = e.version_sha
+    UNION ALL
+    SELECT DISTINCT e.subject, p.position, 1, 'record', e.step, e.key, NULL
+    FROM manifest_entries e
+    JOIN pipeline p ON p.step = e.step
+    LEFT JOIN records r ON r.key = e.key
+    WHERE e.key IS NOT NULL AND NOT e.failed AND r.result_sha IS NOT e.result_sha
+    UNION ALL
+    SELECT DISTINCT e.subject, p.position, 2, 'failed', e.step, e.key, NULL
+    FROM manifest_entries e
+    JOIN pipeline p ON p.step = e.step
+    WHERE e.failed
+    UNION ALL
+    SELECT m.subject, p.position, 3, 'missing_step', p.step, NULL, NULL
+    FROM manifests m CROSS JOIN pipeline p
+    WHERE ? AND NOT EXISTS (SELECT 1 FROM manifest_entries e WHERE e.subject = m.subject AND e.step = p.step)
+)
+SELECT subject, kind, step, value, components FROM reasons ORDER BY subject, position, kind_order, value
+"""
 
 
 class SqliteStore:
@@ -356,6 +399,52 @@ class SqliteStore:
             'SELECT components FROM versions WHERE version_sha = ?', (sha,)
         ).fetchone()
         return None if row is None else json.loads(row[0])
+
+    def put_manifest(self, subject: str, source: str | None, entries):
+        """Replace the manifest of `subject`. Each entry is (step, version_sha, key, result_sha, failed)."""
+        with self._write() as c:
+            c.execute(
+                'INSERT INTO manifests (subject, produced_at, source) VALUES (?, ?, ?) ON CONFLICT (subject) '
+                'DO UPDATE SET produced_at = excluded.produced_at, source = excluded.source',
+                (subject, _stamp(), source),
+            )
+            c.execute('DELETE FROM manifest_entries WHERE subject = ?', (subject,))
+            c.executemany(
+                'INSERT INTO manifest_entries (subject, step, version_sha, key, result_sha, failed) '
+                'VALUES (?, ?, ?, ?, ?, ?)',
+                [(subject, *entry) for entry in entries],
+            )
+
+    def get_manifest(self, subject: str) -> Manifest | None:
+        rows = self._conn().execute(
+            'SELECT m.produced_at, m.source, e.step, e.version_sha, e.key, e.result_sha, e.failed FROM manifests m '
+            'LEFT JOIN manifest_entries e ON e.subject = m.subject WHERE m.subject = ?',
+            (subject,),
+        ).fetchall()
+        if not rows:
+            return None
+        entries = frozenset((*row[2:6], bool(row[6])) for row in rows if row[2] is not None)
+        return Manifest(subject, rows[0][0], rows[0][1], entries)
+
+    def stale_reasons(self, pipeline: dict[str, str], complete: bool) -> list[tuple]:
+        """Compare every manifest with `pipeline`, which maps step names to their current version_sha.
+
+        Returns (subject, kind, step, value, components) rows, sorted by subject, then pipeline
+        order, then kind, then value. Entries of steps not in `pipeline` are ignored.
+
+        - 'version': one row per subject, step and old version_sha. `value` is the old version_sha
+          and `components` its stored components, or None when `versions` lacks it.
+        - 'record': one row per subject and key of an entry that did not fail and whose record is
+          gone or has another result_sha. `value` is the key.
+        - 'failed': one row per subject, step and key of a failed entry. `value` is the key, which
+          may be None.
+        - 'missing_step': only with `complete`, a pipeline step the manifest has no entry for.
+        """
+        rows = self._conn().execute(_STALE, (json.dumps(list(pipeline.items())), complete)).fetchall()
+        return [
+            (subject, kind, step, value, None if components is None else json.loads(components))
+            for subject, kind, step, value, components in rows
+        ]
 
 
 def _use_wal(c: sqlite3.Connection):
