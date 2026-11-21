@@ -11,8 +11,10 @@ Status: 0.1.0. The API may still change before 1.0.
 
 ## Install
 
+stepcache is not on PyPI yet. Install it from this repository:
+
 ```
-pip install stepcache
+pip install git+https://github.com/karlla1220/stepcache
 ```
 
 stepcache has no dependencies outside the standard library.
@@ -165,8 +167,8 @@ On a miss, a process claims the key before it runs the step. Other processes tha
 same key wait for the result and do not compute it again. Each claim names a lock file that
 the claiming process holds with `flock`. When that process dies, even by `SIGKILL`, the
 kernel releases the lock. A waiting process checks the owner every half second, sees
-that it is dead, and takes over the claim. stepcache does not release the claim of a process that is alive but stuck. Stop that
-process to release its claim.
+that it is dead, and takes over the claim. stepcache does not release the claim of a process
+that is alive but stuck. Stop that process to release its claim.
 
 ## Supported environments
 

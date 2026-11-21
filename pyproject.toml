@@ -12,7 +12,6 @@ license = "Apache-2.0"
 license-files = ["LICENSE"]
 dependencies = []
 classifiers = [
-    "License :: OSI Approved :: Apache Software License",
     "Operating System :: MacOS",
     "Operating System :: POSIX :: Linux",
     "Programming Language :: Python :: 3",

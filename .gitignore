@@ -1,6 +1,9 @@
 # Internal notes: consumer names, issue numbers, package index, production host.
 internal/
 
+# Claude Code agent worktrees and local settings.
+.claude/
+
 .DS_Store
 .venv/
 __pycache__/
