@@ -2,6 +2,7 @@ import asyncio
 import socket
 import threading
 import time
+from contextlib import suppress
 from dataclasses import dataclass
 from importlib.metadata import PackageNotFoundError, version
 from itertools import groupby
@@ -47,8 +48,9 @@ class Reason:
       'new': version_sha, 'changed': ...}. `changed` holds only the parts that differ: 'code'
       and 'rev' as {'old', 'new'}, 'files' and 'tools' as {'added', 'removed', 'changed'} with
       sorted names. It is None when the old version's components were never stored.
-    - 'record': the record of `detail['key']` is gone or has another result than the manifest's,
-      or the manifest has no result for the key because the step failed there.
+    - 'record': the record of `detail['key']` is gone or has another result than the manifest's.
+    - 'failed': the step failed for `detail['key']` in the block that made the manifest. The key is
+      None for a `cache=False` step and for inputs that could not make a key.
     - 'missing_step': the manifest has no entry for the step. `detail` is {}.
     """
 
@@ -257,10 +259,12 @@ class Subject:
     """The manifest of one subject while it is processed. Threads may share one Subject.
 
     `run`, `run_many` and `async_run` return what the `StepCache` methods return, and record
-    (step, version_sha, key, result_sha) for each result. A `cache=False` step has no key or
-    result_sha, and a `run_many` error has no result_sha. A call that raises records nothing.
-    Each (step, version_sha, key) is recorded once, and a result with a result_sha replaces the
-    recorded one, so an error retried successfully in the block leaves only the good entry.
+    (step, version_sha, key) -> (result_sha, failed) for each result. A `cache=False` step has no
+    key or result_sha. A failure is a `run_many` result with status 'error' or a call that raises,
+    and is recorded as (None, True). A call that raises records its failure and re-raises. Its key
+    is None for a `cache=False` step and for inputs that cannot make a key.
+    Each (step, version_sha, key) is recorded once. A success replaces a failure and a failure
+    never replaces a success, so a failure retried successfully in the block leaves only the success.
     When the `with` block ends normally, the recorded entries replace the subject's manifest.
     When it raises, the previous manifest stays.
     """
@@ -277,10 +281,14 @@ class Subject:
 
     def __exit__(self, exc_type, exc, tb):
         if exc_type is None:
-            self.cache.store.put_manifest(self.name, self.source, [(*k, v) for k, v in self._entries.items()])
+            self.cache.store.put_manifest(self.name, self.source, [(*k, *v) for k, v in self._entries.items()])
 
     def run(self, step: Step, inputs: dict) -> Result:
-        res = self.cache.run(step, inputs)
+        try:
+            res = self.cache.run(step, inputs)
+        except BaseException as e:
+            self._add(step, [_failed(_key_or_none(step, inputs), e)])
+            raise
         self._add(step, [res])
         return res
 
@@ -290,7 +298,11 @@ class Subject:
         return results
 
     async def async_run(self, step: Step, inputs: dict) -> Result:
-        res = await self.cache.async_run(step, inputs)
+        try:
+            res = await self.cache.async_run(step, inputs)
+        except BaseException as e:
+            self._add(step, [_failed(_key_or_none(step, inputs), e)])
+            raise
         self._add(step, [res])
         return res
 
@@ -300,15 +312,16 @@ class Subject:
         with self._lock:
             for res in results:
                 entry = (step.name, step.version.sha, res.key)
-                if res.result_sha is not None or entry not in self._entries:
-                    self._entries[entry] = res.result_sha
+                failed = res.status == 'error'
+                if not failed or entry not in self._entries:
+                    self._entries[entry] = (res.result_sha, failed)
 
 
 def _reason(step: Step, kind: str, value: str | None, old: dict | None) -> Reason:
     if kind == 'version':
         changed = None if old is None else _changed(old, step.version.components)
         return Reason(kind, step.name, {'old': value, 'new': step.version.sha, 'changed': changed})
-    return Reason(kind, step.name, {'key': value} if kind == 'record' else {})
+    return Reason(kind, step.name, {} if kind == 'missing_step' else {'key': value})
 
 
 def _changed(old: dict, new: dict) -> dict:
@@ -331,6 +344,13 @@ def _changed(old: dict, new: dict) -> dict:
 def _key(step: Step, inputs: dict) -> tuple[str, dict]:
     encoded_inputs = encode(inputs)
     return digest([KEY_FORMAT, step.name, step.version.sha, encoded_inputs]), encoded_inputs
+
+
+def _key_or_none(step: Step, inputs: dict) -> str | None:
+    if step.cache:
+        with suppress(Exception):
+            return _key(step, inputs)[0]
+    return None
 
 
 def _check_sync(step: Step):

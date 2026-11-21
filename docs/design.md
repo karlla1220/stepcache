@@ -198,7 +198,7 @@ Manifest {
   subject: 'tdoc:R1-2609206' | 'spec:38.331-i60',
   produced_at,
   source: sha | null,                  # 애플리케이션이 넣는 원본 지문(선택)
-  entries: [ {step, version_sha, key | null, result_sha | null}, ... ]   # cache=False 단계는 key·result_sha가 null
+  entries: [ {step, version_sha, key | null, result_sha | null, failed}, ... ]   # cache=False 단계는 key·result_sha가 null, 실패한 항목은 result_sha가 null
 }
 ```
 
@@ -214,6 +214,8 @@ with cache.subject('tdoc:R1-2609206', source=docx_sha) as s:
 ```
 
 - `s.run`, `s.run_many`, `s.async_run`은 `cache`의 것과 같고, 쓰인 레코드를 매니페스트 항목으로 모은다.
+- 실패도 항목으로 남긴다. `run_many` 결과의 status가 `'error'`이거나 `s.run`·`s.async_run`이 예외를 던지면 `failed`인 항목을 남긴다. 예외는 그대로 다시 던진다. 그래서 블록 안에서 예외를 잡고 계속해도 그 subject는 stale로 남는다. 예외를 던진 호출의 키는 입력으로 만든 키다. `cache=False` 단계이거나 입력으로 키를 만들 수 없으면 null이다.
+- 항목은 (단계, 단계 버전, 키)마다 하나다. 성공은 실패를 대신하고, 실패는 성공을 대신하지 않는다. 그래서 블록 안에서 실패한 것을 다시 시도해 성공하면 성공한 항목만 남는다. `cache=False` 단계는 키가 null이므로, 한 블록에서 한 번 성공하고 한 번 실패해도 성공이 남는다.
 - `with` 블록이 정상으로 끝날 때만 매니페스트를 저장한다. 예외로 끝나면 아무것도 쓰지 않는다. 이전 매니페스트가 남아 그 subject는 계속 stale로 보이고, 다시 처리 대상이 된다.
 - 한 subject 세션을 여러 스레드가 같이 써도 된다.
 
@@ -227,7 +229,8 @@ cache.stale_subjects(pipeline=[outline, render, ocr, vlm_alt], complete=True)
 subject는 다음 중 하나라도 해당하면 stale이다.
 
 - `version`: 매니페스트의 `version_sha`가 지금 그 단계의 버전과 다르다. 이유에 달라진 구성 요소를 담는다.
-- `record`: 매니페스트가 가리키는 키의 레코드가 없거나(무효화됨), 레코드의 `result_sha`가 매니페스트와 다르다(무효화 뒤 다른 문서가 다시 계산함).
+- `record`: 매니페스트가 가리키는 키의 레코드가 없거나(무효화됨), 레코드의 `result_sha`가 매니페스트와 다르다(무효화 뒤 다른 문서가 다시 계산함). 실패한 항목은 `record`가 아니라 `failed`로 나온다.
+- `failed`: 매니페스트를 만든 블록에서 그 단계가 실패했다(5.1). 이유에 실패한 키를 담는다. 키는 null일 수 있다.
 - `missing_step`: `complete=True`일 때만 따진다. `pipeline`의 단계가 매니페스트에 없다(파이프라인에 단계가 새로 생김).
 
 `pipeline`에 없는 단계의 항목은 무시한다. 원본이 바뀌었는지(`source`)는 애플리케이션이 `cache.manifest(subject)`로 매니페스트를 읽어 비교한다. 매니페스트가 없으면 `None`이다.
@@ -264,7 +267,7 @@ DB 테이블:
 | `blobs` | blob마다 한 행: `sha, size, last_used_at, data`. 256 KiB 이하는 `data`에 바이트가 들어가고(SQLite BLOB), 그보다 크면 `data`가 비어 있고 바이트는 `files/ab/cdef…`(sha로 정해지는 경로) 파일에 있다. |
 | `versions` | 단계 버전마다 한 행: `version_sha`와 구성 요소(3.1). stale 이유의 "달라진 구성 요소"도 여기서 찾는다. |
 | `manifests` | subject당 한 행(5): `produced_at`, `source`. |
-| `manifest_entries` | 매니페스트 항목마다 한 행: `subject, step, version_sha, key, result_sha`. stale 조회를 SQL 한 번으로 한다. 매니페스트를 쓸 때 한 트랜잭션에서 그 subject의 옛 항목을 지우고 새 항목을 넣는다. |
+| `manifest_entries` | 매니페스트 항목마다 한 행: `subject, step, version_sha, key, result_sha, failed`. stale 조회를 SQL 한 번으로 한다. 매니페스트를 쓸 때 한 트랜잭션에서 그 subject의 옛 항목을 지우고 새 항목을 넣는다. |
 | `claims` | 실행 중 표시(6.2). |
 | `meta` | `schema_version`. |
 
