@@ -177,9 +177,10 @@ def test_processes_opening_an_empty_db_at_once_create_the_schema_once(tmp_path, 
     assert all(store.has(sha(f'blob {i}'.encode())) for i in range(n))
 
 
-def test_opening_a_db_with_another_schema_version_is_refused(store):
+@pytest.mark.parametrize('version', [1, 3], ids=['before-failed-entries', 'newer'])
+def test_opening_a_db_with_another_schema_version_is_refused(store, version):
     with closing(sqlite3.connect(store.path)) as c, c:
-        c.execute("UPDATE meta SET value = 2 WHERE name = 'schema_version'")
+        c.execute("UPDATE meta SET value = ? WHERE name = 'schema_version'", (version,))
     with pytest.raises(SchemaMismatch):
         SqliteStore(store.path, files=store.files)
 

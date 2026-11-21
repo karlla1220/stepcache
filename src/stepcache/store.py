@@ -13,7 +13,7 @@ from dataclasses import dataclass, fields, replace
 from datetime import datetime, timezone
 from pathlib import Path
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 INLINE_BLOB_MAX = 256 * 1024
 BUSY_TIMEOUT_SECONDS = 60
 
