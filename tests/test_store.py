@@ -149,7 +149,7 @@ needs_fork = pytest.mark.skipif(not hasattr(os, 'fork'), reason='needs os.fork')
 
 def in_another_process(store, expression: str) -> str:
     code = (
-        'import sys; from stepcache import SqliteStore; '
+        'import os, sys; from stepcache import SqliteStore; '
         f'store = SqliteStore(sys.argv[1], files=sys.argv[2]); print({expression})'
     )
     out = subprocess.run([sys.executable, '-c', code, store.path, store.files], capture_output=True, text=True, check=True)
@@ -222,6 +222,22 @@ def test_a_process_deletes_its_lock_file_when_it_exits(store):
     out = subprocess.run([sys.executable, '-c', code, store.path, store.files], capture_output=True, text=True, check=True)
     assert out.stdout.strip() == '1'
     assert list(locks.iterdir()) == []
+
+
+def test_a_process_deletes_the_lock_files_of_dead_processes_when_it_creates_its_own(store):
+    locks = store.path.with_name(f'{store.path.name}.locks')
+    queue = multiprocessing.Queue()
+    live = multiprocessing.Process(target=claim_and_block, args=(store.path, store.files, queue))
+    live.start()
+    try:
+        live_owner = queue.get(timeout=30)
+        for _ in range(2):
+            in_another_process(store, '[store.claim("dead"), store.release("dead"), os._exit(0)]')
+        assert len(list(locks.iterdir())) == 2  # the live file and the last dead one, which swept the first
+        store.claim('mine')
+        assert sorted(p.name for p in locks.iterdir()) == sorted([live_owner, store.claim_owner('mine')])
+    finally:
+        live.kill()
 
 
 @needs_fork

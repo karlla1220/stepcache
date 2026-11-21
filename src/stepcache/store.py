@@ -331,9 +331,14 @@ class SqliteStore:
             if self._locks not in _held_locks:
                 self._locks.mkdir(exist_ok=True)
                 name = secrets.token_hex(16)
-                fd = os.open(self._locks / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+                # The file gets a lock file name only once it is locked, so a sweep never deletes it.
+                tmp = self._locks / f'{name}.tmp'
+                fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
                 fcntl.flock(fd, fcntl.LOCK_EX)
+                os.rename(tmp, self._locks / name)
                 _held_locks[self._locks] = (fd, name)
+                for path in self._locks.iterdir():
+                    self.owner_alive(path.name)
             return _held_locks[self._locks][1]
 
     def put_version(self, sha: str, components: dict):
