@@ -4,6 +4,8 @@ import threading
 import time
 from dataclasses import dataclass
 from importlib.metadata import PackageNotFoundError, version
+from itertools import groupby
+from operator import itemgetter
 
 from .step import KEY_FORMAT, Blob, Refused, Step, check_outputs, digest, encode, encode_outputs
 from .store import Record, SqliteStore
@@ -35,6 +37,24 @@ class Result:
     key: str | None
     result_sha: str | None
     error: BaseException | None = None
+
+
+@dataclass(frozen=True)
+class Reason:
+    """Why a subject is stale. `step` is a step name.
+
+    - 'version': the manifest used another version of the step. `detail` is {'old': version_sha,
+      'new': version_sha, 'changed': ...}. `changed` holds only the parts that differ: 'code'
+      and 'rev' as {'old', 'new'}, 'files' and 'tools' as {'added', 'removed', 'changed'} with
+      sorted names. It is None when the old version's components were never stored.
+    - 'record': the record of `detail['key']` is gone or has another result than the manifest's,
+      or the manifest has no result for the key because the step failed there.
+    - 'missing_step': the manifest has no entry for the step. `detail` is {}.
+    """
+
+    kind: str
+    step: str
+    detail: dict
 
 
 class StepCache:
@@ -136,6 +156,19 @@ class StepCache:
     def subject(self, name: str, source: str | None = None) -> 'Subject':
         """Start recording the manifest of the subject `name`. Use the result in a `with` block."""
         return Subject(self, name, source)
+
+    def stale_subjects(self, pipeline: list[Step], complete: bool = False) -> list[tuple[str, list[Reason]]]:
+        """Return each subject to process again with its reasons, sorted by subject.
+
+        Pipeline steps are matched to manifest entries by name, and entries of other steps are
+        ignored. A pipeline step that a manifest lacks is a reason only with `complete`.
+        """
+        steps = {step.name: step for step in pipeline}
+        rows = self.store.stale_reasons({name: step.version.sha for name, step in steps.items()}, complete)
+        return [
+            (subject, [_reason(steps[name], kind, value, old) for _, kind, name, value, old in group])
+            for subject, group in groupby(rows, key=itemgetter(0))
+        ]
 
     def _record_or_claim(self, key: str):
         held = False
@@ -261,6 +294,30 @@ class Subject:
             self.cache.store.put_version(step.version.sha, step.version.components)
         with self._lock:
             self._entries.update((step.name, step.version.sha, res.key, res.result_sha) for res in results)
+
+
+def _reason(step: Step, kind: str, value: str | None, old: dict | None) -> Reason:
+    if kind == 'version':
+        changed = None if old is None else _changed(old, step.version.components)
+        return Reason(kind, step.name, {'old': value, 'new': step.version.sha, 'changed': changed})
+    return Reason(kind, step.name, {'key': value} if kind == 'record' else {})
+
+
+def _changed(old: dict, new: dict) -> dict:
+    changed = {}
+    for part in ('code', 'files', 'tools', 'rev'):
+        a, b = old[part], new[part]
+        if a == b:
+            continue
+        if part in ('files', 'tools'):
+            changed[part] = {
+                'added': sorted(b.keys() - a.keys()),
+                'removed': sorted(a.keys() - b.keys()),
+                'changed': sorted(name for name in a.keys() & b.keys() if a[name] != b[name]),
+            }
+        else:
+            changed[part] = {'old': a, 'new': b}
+    return changed
 
 
 def _key(step: Step, inputs: dict) -> tuple[str, dict]:

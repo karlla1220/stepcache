@@ -23,7 +23,7 @@ from pathlib import Path
 import pytest
 
 import stepcache.cache
-from stepcache import Blob, Refused, SqliteStore, Step, StepCache, Version
+from stepcache import Blob, Reason, Refused, SqliteStore, Step, StepCache, Version
 
 
 @pytest.fixture
@@ -33,6 +33,7 @@ def cache(store):
 
 def sha(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
 
 
 def spec_digest(value) -> str:
@@ -747,3 +748,143 @@ def test_a_subject_records_each_step_version_key_and_result_it_used_once(cache, 
             s.run(step, {'x': 4})
             raise RuntimeError('converter crashed')
     assert (manifest(store, 'A'), manifest(store, 'B')) == (expected, None)
+
+
+def test_invalidating_a_key_two_subjects_share_makes_both_stale_until_each_is_processed_again(cache):
+    render, renders = counted(lambda inputs: {'png': Blob(b'png of ' + inputs['figure'].read())})
+    alt, alts = counted(lambda inputs: {'alt': Blob(secrets.token_bytes(16))})
+    render_step, alt_step = Step('render', Version.of(), render), Step('vlm.alt', Version.of(), alt)
+    pipeline = [render_step, alt_step]
+
+    def process(subject):
+        with cache.subject(subject) as s:
+            png = s.run(render_step, {'figure': Blob(b'picture X')}).outputs['png']
+            return s.run(alt_step, {'png': png})
+
+    b1, a1 = process('B'), process('A')
+    assert (a1.key, a1.result_sha) == (b1.key, b1.result_sha)
+    assert (len(renders), len(alts), cache.stale_subjects(pipeline)) == (1, 1, [])
+
+    cache.invalidate(alt_step, a1.key)
+    record_k = [Reason('record', 'vlm.alt', {'key': a1.key})]
+    assert cache.stale_subjects(pipeline) == [('A', record_k), ('B', record_k)]
+
+    b2 = process('B')
+    assert not b2.hit and b2.result_sha != a1.result_sha
+    assert (len(renders), len(alts)) == (1, 2)
+    assert cache.stale_subjects(pipeline) == [('A', record_k)]
+
+    a2 = process('A')
+    assert a2.hit and a2.result_sha == b2.result_sha
+    assert (len(renders), len(alts), cache.stale_subjects(pipeline)) == (1, 2, [])
+
+
+@pytest.mark.parametrize('cached', [True, False], ids=['cached', 'cache-false'])
+def test_changing_a_step_version_makes_its_subjects_stale_and_names_what_changed(cache, tmp_path, load_module, cached):
+    (tmp_path / 'prompt.txt').write_text('describe the figure')
+    (tmp_path / 'schema.json').write_text('{}')
+    a = load_module('steps_a', 'def run(inputs):\n    return {}\n')
+    b = load_module('steps_b', 'def run(inputs):\n    return {}  # edited\n')
+    files = Version.files(tmp_path, ['prompt.txt', 'schema.json'])
+    old = Step('vlm', Version.of(files=files, tools={'model': 'm1', 'ocr': 'o1'}, rev='1'), a.run, cache=cached)
+    ocr = Step('ocr', Version.of(), double)
+    with cache.subject('A') as s:
+        s.run(old, {'x': 1})
+        s.run(old, {'x': 2})
+    with cache.subject('B') as s:
+        s.run(ocr, {'x': 1})
+    (tmp_path / 'prompt.txt').write_text('describe the figure briefly')
+    (tmp_path / 'examples.txt').write_text('a chart')
+    new_files = Version.files(tmp_path, ['prompt.txt', 'examples.txt'])
+    new = Step('vlm', Version.of(files=new_files, tools={'model': 'm2', 'fonts': 'f1'}, rev='2'), b.run, cache=cached)
+    assert cache.stale_subjects([ocr, new]) == [('A', [Reason('version', 'vlm', {
+        'old': old.version.sha,
+        'new': new.version.sha,
+        'changed': {
+            'code': {
+                'old': sha((tmp_path / 'steps_a.py').read_bytes()),
+                'new': sha((tmp_path / 'steps_b.py').read_bytes()),
+            },
+            'files': {'added': ['examples.txt'], 'removed': ['schema.json'], 'changed': ['prompt.txt']},
+            'tools': {'added': ['fonts'], 'removed': ['ocr'], 'changed': ['model']},
+            'rev': {'old': '1', 'new': '2'},
+        },
+    })])]
+    model_only = Step('vlm', Version.of(files=files, tools={'model': 'm2', 'ocr': 'o1'}, rev='1'), a.run, cache=cached)
+    [(_, [reason])] = cache.stale_subjects([ocr, model_only])
+    assert reason.detail['changed'] == {'tools': {'added': [], 'removed': [], 'changed': ['model']}}
+
+
+def test_a_version_reason_names_no_parts_when_the_old_version_was_never_stored(cache):
+    def run_batch(inputs_list):
+        return [RuntimeError('model timed out')] * len(inputs_list)
+
+    old = Step('vlm', Version.of(rev='1'), double, run_batch=run_batch)
+    with cache.subject('A') as s:
+        [failed] = s.run_many(old, [{'x': 1}])
+    new = Step('vlm', Version.of(rev='2'), double)
+    assert cache.stale_subjects([new]) == [('A', [
+        Reason('version', 'vlm', {'old': old.version.sha, 'new': new.version.sha, 'changed': None}),
+        Reason('record', 'vlm', {'key': failed.key}),
+    ])]
+
+
+def test_a_block_that_raises_leaves_the_previous_manifest(cache):
+    old, new = Step('s', Version.of(rev='1'), double), Step('s', Version.of(rev='2'), double)
+    with cache.subject('A') as s:
+        s.run(old, {'x': 1})
+    with pytest.raises(RuntimeError), cache.subject('A') as s:
+        s.run(new, {'x': 1})
+        raise RuntimeError('converter crashed')
+    with pytest.raises(RuntimeError), cache.subject('B'):
+        raise RuntimeError('converter crashed')
+    assert cache.stale_subjects([new], complete=True) == [('A', [Reason('version', 's', {
+        'old': old.version.sha, 'new': new.version.sha, 'changed': {'rev': {'old': '1', 'new': '2'}},
+    })])]
+
+
+def test_only_complete_reports_a_step_a_manifest_lacks_and_steps_outside_the_pipeline_are_ignored(cache):
+    dropped, kept, added = (Step(name, Version.of(), double) for name in ('dropped', 'kept', 'added'))
+    with cache.subject('A') as s:
+        dropped_key = s.run(dropped, {'x': 1}).key
+        s.run(kept, {'x': 1})
+    cache.invalidate(dropped, dropped_key)
+    assert cache.stale_subjects([kept, added]) == []
+    assert cache.stale_subjects([kept, added], complete=True) == [('A', [Reason('missing_step', 'added', {})])]
+    assert cache.stale_subjects([dropped, kept]) == [('A', [Reason('record', 'dropped', {'key': dropped_key})])]
+
+
+def test_a_subject_that_kept_going_past_a_run_many_error_is_stale_until_processed_again(cache):
+    answers = {1: {'y': 1}, 2: RuntimeError('model timed out')}
+    step = Step('vlm', Version.of(), double, run_batch=lambda inputs_list: [answers[i['x']] for i in inputs_list])
+
+    def process():
+        with cache.subject('A') as s:
+            return s.run_many(step, [{'x': 1}, {'x': 2}])
+
+    ok, failed = process()
+    assert (ok.status, failed.status) == ('ok', 'error')
+    assert cache.stale_subjects([step]) == [('A', [Reason('record', 'vlm', {'key': failed.key})])]
+    answers[2] = {'y': 2}
+    process()
+    assert cache.stale_subjects([step]) == []
+
+
+def test_threads_sharing_one_subject_lose_no_entries(cache):
+    step = Step('s', Version.of(), double)
+    n, per_thread = 8, 6
+    barrier = threading.Barrier(n)
+
+    def worker(s, i):
+        xs = [{'x': i * per_thread + j} for j in range(per_thread)]
+        barrier.wait()
+        results = [s.run(step, xs[0]), *s.run_many(step, xs[1:-1]), asyncio.run(s.async_run(step, xs[-1]))]
+        return [res.key for res in results]
+
+    with cache.subject('A') as s, ThreadPoolExecutor(n) as pool:
+        keys = [key for keys in pool.map(worker, [s] * n, range(n)) for key in keys]
+    assert len(set(keys)) == n * per_thread
+    for key in keys:
+        cache.invalidate(step, key)
+    [(_, reasons)] = cache.stale_subjects([step])
+    assert sorted(reason.detail['key'] for reason in reasons) == sorted(keys)
