@@ -117,6 +117,20 @@ class Record:
     last_used_at: str | None = None
 
 
+@dataclass(frozen=True)
+class Manifest:
+    """The latest manifest of one subject.
+
+    `produced_at` is when it was stored, as an ISO 8601 UTC time. `source` is what the
+    application passed to `subject`. Each entry is (step, version_sha, key, result_sha).
+    """
+
+    subject: str
+    produced_at: str
+    source: str | None
+    entries: frozenset
+
+
 _RECORD_COLUMNS = [f.name for f in fields(Record)]
 _RECORD_JSON = {'inputs', 'outputs', 'refusal', 'producer'}
 _SELECT_RECORD = f'SELECT {", ".join(_RECORD_COLUMNS)} FROM records WHERE key = ?'
@@ -393,6 +407,18 @@ class SqliteStore:
                 'INSERT INTO manifest_entries (subject, step, version_sha, key, result_sha) VALUES (?, ?, ?, ?, ?)',
                 [(subject, *entry) for entry in entries],
             )
+
+    def get_manifest(self, subject: str) -> Manifest | None:
+        rows = self._conn().execute(
+            'SELECT m.produced_at, m.source, e.step, e.version_sha, e.key, e.result_sha FROM manifests m '
+            'LEFT JOIN manifest_entries e ON e.subject = m.subject WHERE m.subject = ?',
+            (subject,),
+        ).fetchall()
+        if not rows:
+            return None
+        # One query, so a concurrent put_manifest is never half seen. No entries gives one NULL row.
+        entries = frozenset(row[2:] for row in rows if row[2] is not None)
+        return Manifest(subject, rows[0][0], rows[0][1], entries)
 
     def stale_reasons(self, pipeline: dict[str, str], complete: bool) -> list[tuple]:
         """Compare every manifest with `pipeline`, which maps step names to their current version_sha.

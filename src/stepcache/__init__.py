@@ -2,6 +2,6 @@
 
 from .cache import Reason, Result, StepCache, Subject
 from .step import Blob, Refused, Step, Version
-from .store import SchemaMismatch, SqliteStore
+from .store import Manifest, SchemaMismatch, SqliteStore
 
-__all__ = ['Blob', 'Reason', 'Refused', 'Result', 'SchemaMismatch', 'SqliteStore', 'Step', 'StepCache', 'Subject', 'Version']
+__all__ = ['Blob', 'Manifest', 'Reason', 'Refused', 'Result', 'SchemaMismatch', 'SqliteStore', 'Step', 'StepCache', 'Subject', 'Version']

@@ -102,6 +102,7 @@
 - `cache.subject(name, source=)`: `run`, `run_many`, `async_run`. 블록이 정상으로 끝날 때만 매니페스트를 바꾼다.
 - `Step(cache=False)`: 실행만 하고 `(단계, 단계 버전)`을 매니페스트에 남긴다.
 - `cache.stale_subjects(pipeline, complete)`: 이유는 `version`(달라진 구성 요소 포함), `record`, `missing_step`.
+- `cache.manifest(subject)`: subject의 최신 매니페스트. 없으면 `None`.
 
 확인:
 

@@ -893,6 +893,9 @@ def test_manifest_reads_back_the_source_and_entries_a_block_recorded(cache):
         ('outline', outline.version.sha, None, None),
     }))
     assert datetime.fromisoformat(back.produced_at).tzinfo is not None
+    with cache.subject('C'):
+        pass
+    assert cache.manifest('C').entries == frozenset()
     assert cache.manifest('B') is None
 
 

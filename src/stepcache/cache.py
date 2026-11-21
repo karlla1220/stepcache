@@ -8,7 +8,7 @@ from itertools import groupby
 from operator import itemgetter
 
 from .step import KEY_FORMAT, Blob, Refused, Step, check_outputs, digest, encode, encode_outputs
-from .store import Record, SqliteStore
+from .store import Manifest, Record, SqliteStore
 
 try:
     _VERSION = version('stepcache')
@@ -156,6 +156,10 @@ class StepCache:
     def subject(self, name: str, source: str | None = None) -> 'Subject':
         """Start recording the manifest of the subject `name`. Use the result in a `with` block."""
         return Subject(self, name, source)
+
+    def manifest(self, subject: str) -> Manifest | None:
+        """Return the latest manifest of `subject`, or None when it has none."""
+        return self.store.get_manifest(subject)
 
     def stale_subjects(self, pipeline: list[Step], complete: bool = False) -> list[tuple[str, list[Reason]]]:
         """Return each subject to process again with its reasons, sorted by subject.
