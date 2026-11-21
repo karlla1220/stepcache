@@ -291,7 +291,8 @@ class Subject:
         try:
             res = self.cache.run(step, inputs)
         except BaseException as e:
-            self._add(step, [_failed(_key_or_none(step, inputs), e)])
+            with suppress(Exception):
+                self._add(step, [_failed(_key_or_none(step, inputs), e)])
             raise
         self._add(step, [res])
         return res
@@ -300,7 +301,8 @@ class Subject:
         try:
             results = self.cache.run_many(step, inputs_list)
         except BaseException as e:
-            self._add(step, [_failed(_key_or_none(step, inputs), e) for inputs in inputs_list])
+            with suppress(Exception):
+                self._add(step, [_failed(_key_or_none(step, inputs), e) for inputs in inputs_list])
             raise
         self._add(step, results)
         return results
@@ -309,15 +311,13 @@ class Subject:
         try:
             res = await self.cache.async_run(step, inputs)
         except BaseException as e:
-            self._add(step, [_failed(_key_or_none(step, inputs), e)])
+            with suppress(Exception):
+                self._add(step, [_failed(_key_or_none(step, inputs), e)])
             raise
         self._add(step, [res])
         return res
 
     def _add(self, step: Step, results: list[Result]):
-        if step.version.sha not in self.cache._stored_versions:
-            self.cache.store.put_version(step.version.sha, step.version.components)
-            self.cache._stored_versions.add(step.version.sha)
         with self._lock:
             for res in results:
                 entry = (step.name, step.version.sha, res.key)
@@ -326,6 +326,9 @@ class Subject:
                 wins = failed if res.key is None else not failed
                 if wins or entry not in self._entries:
                     self._entries[entry] = (res.result_sha, failed)
+        if step.version.sha not in self.cache._stored_versions:
+            self.cache.store.put_version(step.version.sha, step.version.components)
+            self.cache._stored_versions.add(step.version.sha)
 
 
 def _reason(step: Step, kind: str, value: str | None, old: dict | None) -> Reason:
