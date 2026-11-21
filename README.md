@@ -11,7 +11,8 @@ Status: 0.1.0. The API may still change before 1.0.
 
 ## Install
 
-stepcache is not on PyPI yet. Install it from this repository:
+stepcache is not on PyPI yet. Install it from this repository. This needs `git` on the
+machine, which slim container images such as `python:3.12-slim` do not have.
 
 ```
 pip install git+https://github.com/karlla1220/stepcache
@@ -89,9 +90,12 @@ with tempfile.TemporaryDirectory() as root:
 
 ## Keys and versions
 
-A `Step` has a name, a `Version` and a `run` function. `run` takes a dict of inputs and
-returns a dict of outputs or a `Refused`. Each input and output value is a `Blob` or a JSON
-value. A JSON output can be at most 4096 bytes, so return longer data as a `Blob`.
+`Step(name, version, run, run_batch=None, cache=True)` has a name, a `Version` and a `run`
+function. `run` takes a dict of inputs and returns a dict of outputs or a `Refused`. Each
+input and output value is a `Blob` or a JSON value. A JSON output can be at most 4096
+bytes, so return longer data as a `Blob`. A longer one makes `StepCache.run` raise
+`ValueError`, and nothing is stored. A `Result` of a stored or reused run has
+`status == 'ok'`.
 
 The key of a run is the sha256 of the step name, the version's sha and the inputs. A `Blob`
 enters the key by its sha256 and a JSON value as it is. File names and paths do not enter
@@ -100,8 +104,9 @@ input and its key does not change. That is the early cutoff.
 
 `Version.of(files=None, tools=None, rev='0', code=True)` builds the version from four parts:
 
-- `code` is the sha256 of the module file that defines `run` and `run_batch`. `Step` adds it.
-  Other modules that file imports are not in it.
+- `code` is the sha256 of the module file that defines `run`. When `run_batch` is in another
+  file, it is a hash over both files. `Step` adds it. Other modules that those files import
+  are not in it.
 - `files` maps relative paths to sha256 values. `Version.files(root, patterns)` hashes the
   files under `root` that match the glob patterns.
 - `tools` maps names to strings that identify external programs or models, such as a version
@@ -128,6 +133,11 @@ Hits come from the cache. The misses run in one call of the step's `run_batch`, 
 step raised, or whose `run_batch` item is an exception, gets a result with
 `status == 'error'` and the exception in `error`. The cache stores nothing for it.
 
+`run_batch(inputs_list)` takes a list of inputs dicts and returns a list of the same length,
+in the same order. Each item is a dict of outputs, a `Refused`, or an exception. When
+`run_batch` itself raises, every item it was given gets an `'error'` result. When it returns
+a list of another length, `run_many` raises `ValueError`.
+
 `StepCache.async_run(step, inputs)` is `run` for async code. It awaits an `async def` step
 and calls a sync step directly. An async step runs only through `async_run`, and `run`
 raises `TypeError` for one.
@@ -146,8 +156,9 @@ source.
 `pipeline` and returns `(subject, reasons)` pairs, sorted by subject. Each `Reason` has a
 `kind`, a `step` and a `detail`:
 
-- `version`: the manifest used another version of the step. `detail['changed']` lists the
-  parts that differ.
+- `version`: the manifest used another version of the step. `detail['old']` and
+  `detail['new']` are the two version shas, and `detail['changed']` lists the parts that
+  differ. `changed` is `None` when the old version's parts were never stored.
 - `record`: the stored result is gone, for example after `cache.invalidate(step, key)`, or
   another run stored a different result for the key.
 - `failed`: the step failed in the block that made the manifest. The failure counts even
