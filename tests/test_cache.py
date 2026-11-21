@@ -256,6 +256,11 @@ def test_a_cache_false_step_runs_every_time_and_stores_nothing(cache, store):
     assert not store.has(sha(b'outline'))
 
 
+
+def test_a_cache_false_step_that_returns_a_list_is_an_error(cache):
+    with pytest.raises(TypeError):
+        cache.run(Step('s', Version.of(), lambda inputs: [inputs['x']], cache=False), {'x': 1})
+
 def test_stepcache_imports_without_installed_metadata():
     src = str(Path(__file__).parents[1] / 'src')
     # -S drops site-packages, so the installed package's metadata is not found.
