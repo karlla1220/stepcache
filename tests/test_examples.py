@@ -23,3 +23,7 @@ def test_quickstart_prints_what_its_comments_say():
     run = subprocess.run([sys.executable, QUICKSTART], capture_output=True, text=True, check=True)
     assert run.stdout.splitlines() == printed_comments(source)
 
+
+
+def test_readme_shows_the_quickstart_unchanged():
+    assert f'```python\n{QUICKSTART.read_text()}```' in (ROOT / 'README.md').read_text()
