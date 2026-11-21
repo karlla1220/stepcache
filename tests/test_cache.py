@@ -881,6 +881,21 @@ def test_a_run_many_error_retried_successfully_in_the_same_block_leaves_the_subj
     assert cache.stale_subjects([step]) == []
 
 
+def test_manifest_reads_back_the_source_and_entries_a_block_recorded(cache):
+    step = Step('ocr', Version.of(), double)
+    outline = Step('outline', Version.of(), lambda inputs: {'headings': 2}, cache=False)
+    with cache.subject('A', source='abc') as s:
+        ran = s.run(step, {'x': 1})
+        s.run(outline, {})
+    back = cache.manifest('A')
+    assert back == stepcache.Manifest('A', back.produced_at, 'abc', frozenset({
+        ('ocr', step.version.sha, ran.key, ran.result_sha),
+        ('outline', outline.version.sha, None, None),
+    }))
+    assert datetime.fromisoformat(back.produced_at).tzinfo is not None
+    assert cache.manifest('B') is None
+
+
 def test_threads_sharing_one_subject_lose_no_entries(cache):
     step = Step('s', Version.of(), double)
     n, per_thread = 8, 6
