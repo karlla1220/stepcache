@@ -15,7 +15,7 @@ import threading
 import time
 from collections import Counter
 from concurrent.futures import Future, ThreadPoolExecutor
-from contextlib import closing
+from contextlib import closing, suppress
 from datetime import datetime, timezone
 from importlib.metadata import version
 from pathlib import Path
@@ -23,7 +23,7 @@ from pathlib import Path
 import pytest
 
 import stepcache.cache
-from stepcache import Blob, Reason, Refused, SqliteStore, Step, StepCache, Version
+from stepcache import Blob, Reason, Refused, SqliteStore, Step, StepCache, Subject, Version
 
 
 @pytest.fixture
@@ -703,9 +703,13 @@ def manifest(store, subject) -> tuple[str | None, Counter] | None:
     with closing(sqlite3.connect(store.path)) as c:
         row = c.execute('SELECT source FROM manifests WHERE subject = ?', (subject,)).fetchone()
         entries = Counter(c.execute(
-            'SELECT step, version_sha, key, result_sha FROM manifest_entries WHERE subject = ?', (subject,)
+            'SELECT step, version_sha, key, result_sha, failed FROM manifest_entries WHERE subject = ?', (subject,)
         ))
     return None if row is None else (row[0], entries)
+
+
+def key_of(step: Step, inputs: dict) -> str:
+    return spec_digest(['stepcache/1', step.name, step.version.sha, {k: ['json', v] for k, v in inputs.items()}])
 
 
 def test_a_subject_records_each_step_version_key_and_result_it_used_once(cache, store):
@@ -733,12 +737,13 @@ def test_a_subject_records_each_step_version_key_and_result_it_used_once(cache, 
     assert (ok.outputs, again.hit, refused.status, failed.status) == ({'y': 2}, True, 'refused', 'error')
     assert (outlined.outputs, awaited.outputs) == ({'headings': 2}, {'y': 6})
     expected = ('docx sha', Counter([
-        ('ocr', step.version.sha, ok.key, ok.result_sha),
-        ('ocr', step.version.sha, refused.key, refused.result_sha),
-        ('ocr', step.version.sha, awaited.key, awaited.result_sha),
-        ('vlm', batched.version.sha, done.key, done.result_sha),
-        ('vlm', batched.version.sha, failed.key, None),
-        ('outline', outline.version.sha, None, None),
+        ('ocr', step.version.sha, ok.key, ok.result_sha, 0),
+        ('ocr', step.version.sha, refused.key, refused.result_sha, 0),
+        ('ocr', step.version.sha, key_of(step, {'x': -1}), None, 1),
+        ('ocr', step.version.sha, awaited.key, awaited.result_sha, 0),
+        ('vlm', batched.version.sha, done.key, done.result_sha, 0),
+        ('vlm', batched.version.sha, failed.key, None, 1),
+        ('outline', outline.version.sha, None, None, 0),
     ]))
     assert manifest(store, 'A') == expected
     assert store.get_version(outline.version.sha) == outline.version.components
@@ -824,7 +829,7 @@ def test_a_version_reason_names_no_parts_when_the_old_version_was_never_stored(c
     new = Step('vlm', Version.of(rev='2'), double)
     assert cache.stale_subjects([new]) == [('A', [
         Reason('version', 'vlm', {'old': old.version.sha, 'new': new.version.sha, 'changed': None}),
-        Reason('record', 'vlm', {'key': failed.key}),
+        Reason('failed', 'vlm', {'key': failed.key}),
     ])]
 
 
@@ -863,7 +868,7 @@ def test_a_subject_that_kept_going_past_a_run_many_error_is_stale_until_processe
 
     ok, failed = process()
     assert (ok.status, failed.status) == ('ok', 'error')
-    assert cache.stale_subjects([step]) == [('A', [Reason('record', 'vlm', {'key': failed.key})])]
+    assert cache.stale_subjects([step]) == [('A', [Reason('failed', 'vlm', {'key': failed.key})])]
     answers[2] = {'y': 2}
     process()
     assert cache.stale_subjects([step]) == []
@@ -880,6 +885,73 @@ def test_a_run_many_error_retried_successfully_in_the_same_block_leaves_the_subj
     assert cache.stale_subjects([step]) == []
 
 
+def fail(inputs):
+    raise RuntimeError('model timed out')
+
+
+@pytest.mark.parametrize(
+    'call', [Subject.run, lambda s, step, inputs: asyncio.run(s.async_run(step, inputs))], ids=['run', 'async_run']
+)
+def test_a_subject_that_caught_a_raised_failure_in_the_block_is_stale(cache, call):
+    vlm = Step('vlm', Version.of(), lambda inputs: fail(inputs) if inputs['img'] == 'bad' else {'alt': inputs['img']})
+    with cache.subject('A') as s:
+        for img in ['ok1', 'bad', 'ok2']:
+            try:
+                call(s, vlm, {'img': img})
+            except RuntimeError:
+                pass
+    bad = key_of(vlm, {'img': 'bad'})
+    assert cache.stale_subjects([vlm], complete=True) == [('A', [Reason('failed', 'vlm', {'key': bad})])]
+
+
+@pytest.mark.parametrize(
+    'call',
+    [
+        lambda s, step: s.run_many(step, [{'x': 1}]),
+        lambda s, step: s.run(step, {'x': 1}),
+        lambda s, step: asyncio.run(s.async_run(step, {'x': 1})),
+    ],
+    ids=['run_many', 'run', 'async_run'],
+)
+def test_a_subject_whose_cache_false_step_failed_in_the_block_is_stale(cache, call):
+    vlm, outline = Step('vlm', Version.of(), double), Step('outline', Version.of(), fail, cache=False)
+    with cache.subject('B') as s:
+        s.run(vlm, {'x': 1})
+        with suppress(RuntimeError):
+            call(s, outline)
+    assert cache.stale_subjects([vlm, outline], complete=True) == [('B', [Reason('failed', 'outline', {'key': None})])]
+
+
+def test_a_run_whose_inputs_have_no_key_is_a_failure_with_no_key(cache):
+    step = Step('vlm', Version.of(), double)
+    with cache.subject('A') as s:
+        with pytest.raises(ValueError):
+            s.run(step, {'x': float('nan')})
+    assert cache.stale_subjects([step]) == [('A', [Reason('failed', 'vlm', {'key': None})])]
+
+
+@pytest.mark.parametrize(
+    'cached, first_fails', [(True, True), (False, True), (False, False)],
+    ids=['cached-retried', 'cache-false-retried', 'cache-false-fails-after-a-success'],
+)
+def test_a_failure_and_a_success_of_one_entry_in_the_same_block_leave_the_subject_fresh(cache, cached, first_fails):
+    answers = iter([RuntimeError('model timed out'), {'y': 1}][::1 if first_fails else -1])
+
+    def answer(inputs):
+        value = next(answers)
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+    step = Step('vlm', Version.of(), answer, cache=cached)
+    with cache.subject('A') as s:
+        for _ in range(2):
+            with suppress(RuntimeError):
+                s.run(step, {'x': 1})
+    assert next(answers, None) is None
+    assert cache.stale_subjects([step], complete=True) == []
+
+
 def test_manifest_reads_back_the_source_and_entries_a_block_recorded(cache):
     step = Step('ocr', Version.of(), double)
     outline = Step('outline', Version.of(), lambda inputs: {'headings': 2}, cache=False)
@@ -888,8 +960,8 @@ def test_manifest_reads_back_the_source_and_entries_a_block_recorded(cache):
         s.run(outline, {})
     back = cache.manifest('A')
     assert back == stepcache.Manifest('A', back.produced_at, 'abc', frozenset({
-        ('ocr', step.version.sha, ran.key, ran.result_sha),
-        ('outline', outline.version.sha, None, None),
+        ('ocr', step.version.sha, ran.key, ran.result_sha, False),
+        ('outline', outline.version.sha, None, None, False),
     }))
     assert datetime.fromisoformat(back.produced_at).tzinfo is not None
     with cache.subject('C'):
