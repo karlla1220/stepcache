@@ -134,7 +134,7 @@
 ```
 uv run pytest                                             # mac, Linux
 docker run --rm --platform linux/arm64 -v "$PWD":/src:ro python:3.12-slim \
-  sh -c 'cp -r /src /work && cd /work && pip install -q -e ".[dev]" && pytest'   # ARM Linux
+  sh -c 'cp -r /src /work && cd /work && rm -rf .venv && pip install -q pytest -e . && pytest'   # ARM Linux
 ```
 
 컨테이너 안에서는 소스를 복사해 컨테이너의 파일 시스템에서 돌린다. 테스트 DB가 mac 폴더의 bind mount 위에 놓이지 않게 하려는 것이다.
