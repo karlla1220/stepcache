@@ -8,7 +8,7 @@ import secrets
 import sqlite3
 import threading
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass, fields, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -307,7 +307,9 @@ class SqliteStore:
         except BlockingIOError:
             return True
         else:
-            path.unlink(missing_ok=True)
+            # Deleting is tidying only. Another user's file in a shared folder may not be ours to delete.
+            with suppress(OSError):
+                path.unlink()
             return False
         finally:
             os.close(fd)
