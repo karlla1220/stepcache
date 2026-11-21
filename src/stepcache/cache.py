@@ -161,7 +161,7 @@ class StepCache:
             return None
         shas = [sha for kind, sha in record.outputs.values() if kind == 'blob']
         if not all(map(self.store.has, shas)):
-            self.store.delete_record(key)
+            self.store.delete_record(key, record.created_at)
             return None
         self.store.touch_record(key)
         for sha in shas:

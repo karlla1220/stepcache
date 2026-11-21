@@ -212,9 +212,12 @@ class SqliteStore:
             row = c.execute(_SELECT_RECORD, (record.key,)).fetchone()
         return _row_record(row)
 
-    def delete_record(self, key: str):
+    def delete_record(self, key: str, created_at: str | None = None):
+        """Delete the record of `key`, or with `created_at` only the record created then."""
         with self._write() as c:
-            c.execute('DELETE FROM records WHERE key = ?', (key,))
+            c.execute(
+                'DELETE FROM records WHERE key = ? AND created_at = coalesce(?, created_at)', (key, created_at)
+            )
 
     def touch_record(self, key: str):
         """Mark the record used now, writing at most once per UTC day."""
