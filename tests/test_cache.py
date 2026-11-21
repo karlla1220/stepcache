@@ -472,6 +472,26 @@ def test_a_waiting_worker_runs_the_step_itself_when_the_owner_raises(cache, monk
     assert len(calls) == 2
 
 
+@pytest.mark.parametrize(
+    'call', [StepCache.run, lambda cache, step, inputs: cache.run_many(step, [inputs])[0]], ids=['run', 'run_many']
+)
+def test_an_error_in_the_lookup_right_after_the_claim_releases_the_claim(cache, store, monkeypatch, call):
+    get_record, keys = store.get_record, []
+
+    def get_record_failing_after_the_claim(key):
+        keys.append(key)
+        if len(keys) == 2:  # the first lookup misses, then the key is claimed and looked up again
+            raise sqlite3.OperationalError('disk I/O error')
+        return get_record(key)
+
+    monkeypatch.setattr(store, 'get_record', get_record_failing_after_the_claim)
+    step = Step('s', Version.of(), double)
+    with pytest.raises(sqlite3.OperationalError):
+        call(cache, step, {'x': 1})
+    assert store.claim_owner(keys[1]) is None
+    assert in_thread(call, cache, step, {'x': 1}).result(10).outputs == {'y': 2}
+
+
 def test_ten_async_runs_of_one_key_run_the_step_once_and_leave_the_loop_free(cache, monkeypatch):
     monkeypatch.setattr('stepcache.cache.WAIT_SECONDS', 0.2)
     calls = []
