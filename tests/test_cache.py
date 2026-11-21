@@ -819,16 +819,17 @@ def test_changing_a_step_version_makes_its_subjects_stale_and_names_what_changed
     assert reason.detail['changed'] == {'tools': {'added': [], 'removed': [], 'changed': ['model']}}
 
 
-def test_a_version_reason_names_no_parts_when_the_old_version_was_never_stored(cache):
+def test_a_version_reason_names_what_changed_for_a_cached_step_that_only_failed(cache):
     def run_batch(inputs_list):
         return [RuntimeError('model timed out')] * len(inputs_list)
 
-    old = Step('vlm', Version.of(rev='1'), double, run_batch=run_batch)
+    old = Step('vlm', Version.of(tools={'model': 'm1'}), double, run_batch=run_batch)
     with cache.subject('A') as s:
         [failed] = s.run_many(old, [{'x': 1}])
-    new = Step('vlm', Version.of(rev='2'), double)
+    new = Step('vlm', Version.of(tools={'model': 'm2'}), double)
+    changed = {'tools': {'added': [], 'removed': [], 'changed': ['model']}}
     assert cache.stale_subjects([new]) == [('A', [
-        Reason('version', 'vlm', {'old': old.version.sha, 'new': new.version.sha, 'changed': None}),
+        Reason('version', 'vlm', {'old': old.version.sha, 'new': new.version.sha, 'changed': changed}),
         Reason('failed', 'vlm', {'key': failed.key}),
     ])]
 
