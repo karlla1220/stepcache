@@ -2,9 +2,12 @@ import hashlib
 import json
 import socket
 import sqlite3
+import subprocess
+import sys
 from contextlib import closing
 from datetime import datetime, timezone
 from importlib.metadata import version
+from pathlib import Path
 
 import pytest
 
@@ -247,3 +250,10 @@ def test_a_cache_false_step_runs_every_time_and_stores_nothing(cache, store):
     assert [(r.hit, r.key, r.result_sha) for r in results] == [(False, None, None)] * 2
     assert results[0].outputs == {'outline': Blob(b'outline')}
     assert not store.has(sha(b'outline'))
+
+
+def test_stepcache_imports_without_installed_metadata():
+    src = str(Path(__file__).parents[1] / 'src')
+    # -S drops site-packages, so the installed package's metadata is not found.
+    code = f'import sys; sys.path.insert(0, {src!r}); import stepcache'
+    assert subprocess.run([sys.executable, '-I', '-S', '-c', code]).returncode == 0
