@@ -1,5 +1,7 @@
+import functools
 import hashlib
 import shutil
+import sys
 from pathlib import Path
 
 import pytest
@@ -60,6 +62,25 @@ def test_a_run_without_a_source_file_is_refused(make_run):
     with pytest.raises(ValueError):
         Step('s', Version.of(), make_run())
     assert Step('s', Version.of(code=False), make_run()).version.components['code'] is None
+
+
+@pytest.mark.parametrize(
+    'make_run',
+    [
+        lambda m: functools.partial(m.run, scale=2),
+        lambda m: m.Run(),
+    ],
+    ids=['partial', 'callable-instance'],
+)
+def test_a_partial_or_callable_instance_is_hashed_by_its_defining_module(load_module, make_run, monkeypatch):
+    module = load_module('steps', (
+        'def run(inputs, scale):\n    return {}\n\n'
+        'class Run:\n    def __call__(self, inputs):\n        return {}\n'
+    ))
+    # inspect finds a class's file through sys.modules, where an import would have put it.
+    monkeypatch.setitem(sys.modules, 'steps', module)
+    step = Step('s', Version.of(), make_run(module))
+    assert step.version.components['code'] == sha(Path(module.__file__).read_bytes())
 
 
 def make_tree(root: Path):
