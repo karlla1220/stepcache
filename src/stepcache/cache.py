@@ -262,8 +262,9 @@ class Subject:
     `run`, `run_many` and `async_run` return what the `StepCache` methods return, and record
     (step, version_sha, key) -> (result_sha, failed) for each result. A `cache=False` step has no
     key or result_sha. A failure is a `run_many` result with status 'error' or a call that raises,
-    and is recorded as (None, True). A call that raises records its failure and re-raises. Its key
-    is None for a `cache=False` step and for inputs that cannot make a key.
+    and is recorded as (None, True). A call that raises records a failure for each inputs dict it
+    was given and re-raises. Its key is None for a `cache=False` step and for inputs that cannot
+    make a key.
     Each (step, version_sha, key) is recorded once. For a key, a success replaces a failure and a
     failure never replaces a success, so a failure retried successfully in the block leaves only
     the success. For the key None it is the other way round, so any failure of a `cache=False`
@@ -296,7 +297,11 @@ class Subject:
         return res
 
     def run_many(self, step: Step, inputs_list: list[dict]) -> list[Result]:
-        results = self.cache.run_many(step, inputs_list)
+        try:
+            results = self.cache.run_many(step, inputs_list)
+        except BaseException as e:
+            self._add(step, [_failed(_key_or_none(step, inputs), e) for inputs in inputs_list])
+            raise
         self._add(step, results)
         return results
 
