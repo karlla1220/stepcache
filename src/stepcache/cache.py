@@ -1,12 +1,17 @@
 import socket
 import time
 from dataclasses import dataclass
-from importlib.metadata import version
+from importlib.metadata import PackageNotFoundError, version
 
 from .step import KEY_FORMAT, Blob, Refused, Step, digest, encode, encode_outputs
 from .store import Record, SqliteStore
 
-_PRODUCER = {'host': socket.gethostname(), 'stepcache': version('stepcache'), 'imported': False}
+try:
+    _VERSION = version('stepcache')
+except PackageNotFoundError:
+    _VERSION = 'unknown'
+
+_PRODUCER = {'host': socket.gethostname(), 'stepcache': _VERSION, 'imported': False}
 
 
 @dataclass(frozen=True)
