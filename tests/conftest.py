@@ -1,6 +1,10 @@
 import importlib.util
+from datetime import datetime, timezone
+from types import SimpleNamespace
 
 import pytest
+
+from stepcache import SqliteStore
 
 
 @pytest.fixture
@@ -16,3 +20,16 @@ def load_module(tmp_path):
         return module
 
     return load
+
+
+@pytest.fixture
+def store(tmp_path):
+    return SqliteStore(tmp_path / 'cache' / 'stepcache.db', files=tmp_path / 'cache' / 'blobs')
+
+
+@pytest.fixture
+def clock(monkeypatch):
+    """The store's clock. Set clock.now to move it."""
+    clock = SimpleNamespace(now=datetime(2026, 1, 1, 9, tzinfo=timezone.utc))
+    monkeypatch.setattr('stepcache.store.now', lambda: clock.now)
+    return clock
