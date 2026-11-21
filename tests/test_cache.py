@@ -1,13 +1,18 @@
 import gc
 import hashlib
 import json
+import multiprocessing
 import os
+import secrets
+import signal
 import socket
 import sqlite3
 import subprocess
 import sys
 import threading
-from concurrent.futures import ThreadPoolExecutor
+import time
+from collections import Counter
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import closing
 from datetime import datetime, timezone
 from importlib.metadata import version
@@ -15,6 +20,7 @@ from pathlib import Path
 
 import pytest
 
+import stepcache.cache
 from stepcache import Blob, Refused, SqliteStore, Step, StepCache, Version
 
 
@@ -192,12 +198,15 @@ def test_a_json_output_over_4_kib_is_an_error_and_stores_nothing(cache, store):
     assert cache.run(step, {'n': fits}).hit
 
 
-def test_run_returns_the_result_another_writer_stored_first(cache):
+def test_run_returns_the_result_another_writer_stored_first(cache, store):
     answers = iter(['mine', 'theirs'])
 
     def run(inputs):
         answer = next(answers)
         if answer == 'mine':
+            # Lose the claim, as when a waiter judged this worker dead, so the inner run computes.
+            with closing(sqlite3.connect(store.path)) as c, c:
+                c.execute('DELETE FROM claims')
             cache.run(step, inputs)
         return {'alt': answer}
 
@@ -299,17 +308,156 @@ def test_a_forked_child_keeps_its_result_after_the_parent_closes_the_store(tmp_p
     assert open_cache().run(step, {'x': 2}).hit
 
 
-def test_threads_sharing_a_cache_run_overlapping_inputs(cache):
-    n = 8
-    step = Step('s', Version.of(), lambda inputs: {'png': Blob(f'png {inputs["x"]}'.encode())})
+def open_cache(root) -> StepCache:
+    return StepCache(SqliteStore(Path(root) / 'stepcache.db', files=Path(root) / 'blobs'))
+
+
+def logged(inputs):
+    with open(inputs['log'], 'a') as f:
+        f.write(f'{inputs["x"]}\n')
+    time.sleep(inputs['sleep'])
+    return {'token': secrets.token_hex(8)}
+
+
+LOGGED = Step('logged', Version.of(), logged)
+
+
+def executions(log) -> Counter:
+    return Counter(Path(log).read_text().split())
+
+
+def run_logged(cache, log, xs, sleep) -> dict:
+    return {x: cache.run(LOGGED, {'x': x, 'log': str(log), 'sleep': sleep}).result_sha for x in xs}
+
+
+def rotated(xs: list, i: int) -> list:
+    return xs[i % len(xs):] + xs[:i % len(xs)]
+
+
+def run_logged_in_process(root, barrier, xs, out):
+    stepcache.cache.WAIT_SECONDS = 0.02
+    cache = open_cache(root)
+    barrier.wait()
+    Path(out).write_text(json.dumps(run_logged(cache, Path(root) / 'log', xs, sleep=0.1)))
+
+
+def test_processes_running_the_same_keys_at_once_run_each_key_once(tmp_path):
+    n, xs = 6, list(range(4))
+    barrier = multiprocessing.Barrier(n)
+    procs = [
+        multiprocessing.Process(
+            target=run_logged_in_process, args=(tmp_path, barrier, rotated(xs, i), tmp_path / f'shas-{i}.json')
+        )
+        for i in range(n)
+    ]
+    for p in procs:
+        p.start()
+    for p in procs:
+        p.join(60)
+    assert [p.exitcode for p in procs] == [0] * n
+    assert executions(tmp_path / 'log') == Counter({str(x): 1 for x in xs})
+    shas = [json.loads((tmp_path / f'shas-{i}.json').read_text()) for i in range(n)]
+    assert all(s == shas[0] for s in shas)
+
+
+def test_threads_sharing_a_cache_run_each_key_once(cache, tmp_path, monkeypatch):
+    monkeypatch.setattr('stepcache.cache.WAIT_SECONDS', 0.01)
+    n, xs = 8, list(range(10))
     barrier = threading.Barrier(n)
 
     def worker(i):
         barrier.wait()
-        for x in range(10):
-            cache.run(step, {'x': (x + i) % 10})
+        return run_logged(cache, tmp_path / 'log', rotated(xs, i), sleep=0.01)
 
     with ThreadPoolExecutor(n) as pool:
-        for future in [pool.submit(worker, i) for i in range(n)]:
-            future.result()
-    assert all(cache.run(step, {'x': x}).hit for x in range(10))
+        shas = list(pool.map(worker, range(n)))
+    assert executions(tmp_path / 'log') == Counter({str(x): 1 for x in xs})
+    assert all(s == shas[0] for s in shas)
+
+
+def wait_until(condition, timeout=30):
+    deadline = time.monotonic() + timeout
+    while not condition():
+        assert time.monotonic() < deadline
+        time.sleep(0.01)
+
+
+def in_thread(fn, *args) -> Future:
+    """Run `fn` in a daemon thread, so that a test failing on a hang does not hang the session."""
+    future = Future()
+
+    def target():
+        try:
+            future.set_result(fn(*args))
+        except BaseException as e:
+            future.set_exception(e)
+
+    threading.Thread(target=target, daemon=True).start()
+    return future
+
+
+def blocks_first(inputs):
+    with open(inputs['log'], 'a') as f:
+        f.write('ran\n')
+    if Path(inputs['log']).read_text().count('\n') == 1:
+        time.sleep(60)
+    return {'pid': os.getpid()}
+
+
+BLOCKS_FIRST = Step('blocks_first', Version.of(), blocks_first)
+
+
+def run_blocks_first_in_process(root, started):
+    stepcache.cache.WAIT_SECONDS = 0.02
+    cache = open_cache(root)
+    started.set()
+    cache.run(BLOCKS_FIRST, {'log': str(Path(root) / 'log')})
+
+
+def test_a_waiting_process_takes_over_the_claim_of_a_killed_owner_at_once(tmp_path):
+    log = tmp_path / 'log'
+    owner_started, waiter_started = multiprocessing.Event(), multiprocessing.Event()
+    owner = multiprocessing.Process(target=run_blocks_first_in_process, args=(tmp_path, owner_started))
+    waiter = multiprocessing.Process(target=run_blocks_first_in_process, args=(tmp_path, waiter_started))
+    owner.start()
+    try:
+        wait_until(lambda: log.exists() and log.read_text() == 'ran\n')
+        waiter.start()
+        waiter_started.wait(30)
+        time.sleep(0.3)
+        assert waiter.is_alive()
+        os.kill(owner.pid, signal.SIGKILL)
+        owner.join()
+        waiter.join(5)
+        assert waiter.exitcode == 0
+        res = open_cache(tmp_path).run(BLOCKS_FIRST, {'log': str(log)})
+        assert res.hit and res.outputs == {'pid': waiter.pid}
+    finally:
+        owner.kill()
+        waiter.kill()
+
+
+def test_a_waiting_worker_runs_the_step_itself_when_the_owner_raises(cache, monkeypatch):
+    monkeypatch.setattr('stepcache.cache.WAIT_SECONDS', 0.01)
+    owner_running, waiter_started = threading.Event(), threading.Event()
+    calls = []
+
+    def run(inputs):
+        calls.append(inputs)
+        if len(calls) == 1:
+            owner_running.set()
+            waiter_started.wait(10)
+            time.sleep(0.1)
+            raise RuntimeError('model timed out')
+        return {'y': 1}
+
+    step = Step('s', Version.of(), run)
+    owner = in_thread(cache.run, step, {'x': 1})
+    owner_running.wait(10)
+    waiter_started.set()
+    waiter = in_thread(cache.run, step, {'x': 1})
+    with pytest.raises(RuntimeError):
+        owner.result(10)
+    res = waiter.result(10)
+    assert not res.hit and res.outputs == {'y': 1}
+    assert len(calls) == 2

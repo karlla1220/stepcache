@@ -13,13 +13,16 @@ except PackageNotFoundError:
 
 _PRODUCER = {'host': socket.gethostname(), 'stepcache': _VERSION, 'imported': False}
 
+WAIT_SECONDS = 0.5
+
 
 @dataclass(frozen=True)
 class Result:
     """The result of one run.
 
-    `outputs` maps names to a Blob or a JSON value and is empty when the step refused.
-    A `cache=False` step's result has no `key` and no `result_sha`.
+    `hit` is False only when this call ran the step. `outputs` maps names to a Blob or a JSON
+    value and is empty when the step refused. A `cache=False` step's result has no `key` and no
+    `result_sha`.
     """
 
     hit: bool
@@ -37,30 +40,70 @@ class StepCache:
     def run(self, step: Step, inputs: dict) -> Result:
         """Return the stored result for these inputs, or run the step and store its result.
 
-        A step that raises stores nothing, and the exception propagates. When another writer
-        stored a result for the key first, that result is returned.
+        While another worker computes the same key, this waits for its result. A step that raises
+        stores nothing, and the exception propagates. When another writer stored a result for the
+        key first, that result is returned.
         """
         if not step.cache:
-            out = step.run(inputs)
-            if isinstance(out, Refused):
-                return Result(False, 'refused', {}, out, None, None)
-            return Result(False, 'ok', check_outputs(out), None, None, None)
-
-        encoded_inputs = encode(inputs)
-        key = digest([KEY_FORMAT, step.name, step.version.sha, encoded_inputs])
-        record = self.store.get_record(key)
+            return _uncached(step.run(inputs))
+        key, encoded_inputs = _key(step, inputs)
+        record = _wait(self._record_or_claim(key))
         if record is not None:
-            shas = [sha for kind, sha in record.outputs.values() if kind == 'blob']
-            if all(map(self.store.has, shas)):
-                self.store.touch_record(key)
-                for sha in shas:
-                    self.store.touch(sha)
-                return self._result(record, hit=True)
-            self.store.delete_record(key)
+            return self._result(record, hit=True)
+        return self._compute(step, key, encoded_inputs, inputs)
 
-        started = time.monotonic()
-        out = step.run(inputs)
-        duration_ms = round((time.monotonic() - started) * 1000)
+    def invalidate(self, step: Step, key: str):
+        """Delete the record of `key`, so the next run computes it again."""
+        self.store.delete_record(key)
+
+    def _record_or_claim(self, key: str):
+        """Return the record of `key` to reuse, or None once this caller holds the claim on `key`.
+
+        Yields once per poll while a live worker holds the claim.
+        """
+        held = False
+        while True:
+            record = self._lookup(key)
+            if held:
+                if record is not None:
+                    # The worker that released the claim before this caller took it wrote this record.
+                    self.store.release(key)
+                return record
+            if record is not None:
+                return record
+            owner = self.store.claim_owner(key)
+            if owner is None:
+                held = self.store.claim(key)
+            elif not self.store.owner_alive(owner):
+                held = self.store.take_over(key, owner)
+            if not held:
+                yield
+
+    def _lookup(self, key: str) -> Record | None:
+        """The record of `key` if it and all its blobs are stored. A record missing a blob is deleted."""
+        record = self.store.get_record(key)
+        if record is None:
+            return None
+        shas = [sha for kind, sha in record.outputs.values() if kind == 'blob']
+        if not all(map(self.store.has, shas)):
+            self.store.delete_record(key)
+            return None
+        self.store.touch_record(key)
+        for sha in shas:
+            self.store.touch(sha)
+        return record
+
+    def _compute(self, step: Step, key: str, encoded_inputs: dict, inputs: dict) -> Result:
+        """Run the step on a key this caller has claimed, store the result and release the claim."""
+        try:
+            started = time.monotonic()
+            out = step.run(inputs)
+            return self._write(step, key, encoded_inputs, out, _ms_since(started))
+        finally:
+            self.store.release(key)
+
+    def _write(self, step: Step, key: str, encoded_inputs: dict, out, duration_ms: int) -> Result:
+        """Store the step's outputs or refusal for `key`, and return the result the store holds."""
         if isinstance(out, Refused):
             status, outputs, refusal = 'refused', {}, {'reason': out.reason, 'detail': out.detail}
         else:
@@ -86,10 +129,6 @@ class StepCache:
         ))
         return self._result(record, hit=False)
 
-    def invalidate(self, step: Step, key: str):
-        """Delete the record of `key`, so the next run computes it again."""
-        self.store.delete_record(key)
-
     def _result(self, record: Record, hit: bool) -> Result:
         outputs = {
             name: Blob._stored(value, self.store.get) if kind == 'blob' else value
@@ -97,3 +136,27 @@ class StepCache:
         }
         refusal = None if record.refusal is None else Refused(**record.refusal)
         return Result(hit, record.status, outputs, refusal, record.key, record.result_sha)
+
+
+def _key(step: Step, inputs: dict) -> tuple[str, dict]:
+    encoded_inputs = encode(inputs)
+    return digest([KEY_FORMAT, step.name, step.version.sha, encoded_inputs]), encoded_inputs
+
+
+def _wait(protocol):
+    while True:
+        try:
+            next(protocol)
+        except StopIteration as done:
+            return done.value
+        time.sleep(WAIT_SECONDS)
+
+
+def _uncached(out) -> Result:
+    if isinstance(out, Refused):
+        return Result(False, 'refused', {}, out, None, None)
+    return Result(False, 'ok', check_outputs(out), None, None, None)
+
+
+def _ms_since(started: float) -> int:
+    return round((time.monotonic() - started) * 1000)
