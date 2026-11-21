@@ -147,19 +147,28 @@ def test_opening_a_db_that_is_not_a_stepcache_db_is_refused(tmp_path):
 needs_fork = pytest.mark.skipif(not hasattr(os, 'fork'), reason='needs os.fork')
 
 
+def in_another_process(store, expression: str) -> str:
+    code = (
+        'import sys; from stepcache import SqliteStore; '
+        f'store = SqliteStore(sys.argv[1], files=sys.argv[2]); print({expression})'
+    )
+    out = subprocess.run([sys.executable, '-c', code, store.path, store.files], capture_output=True, text=True, check=True)
+    return out.stdout.strip()
+
+
 def test_a_claim_has_one_owner_until_the_owner_releases_it(store):
-    other = SqliteStore(store.path, files=store.files)
     assert store.claim('k')
-    assert not store.claim('k') and not other.claim('k')
+    assert not store.claim('k')
     owner = store.claim_owner('k')
-    other.release('k')
-    assert not other.take_over('k', 'not the owner')
-    assert other.claim_owner('k') == owner
+    assert in_another_process(store, '[store.claim("k"), store.release("k"), store.take_over("k", "not the owner")]') == (
+        '[False, None, False]'
+    )
+    assert store.claim_owner('k') == owner
     store.release('k')
     assert store.claim_owner('k') is None
-    assert other.claim('k')
-    assert other.claim_owner('k') != owner
-    assert store.owner_alive(owner) and store.owner_alive(other.claim_owner('k'))
+    assert in_another_process(store, 'store.claim("k")') == 'True'
+    assert store.claim_owner('k') != owner
+    assert store.owner_alive(owner)
 
 
 def test_store_objects_on_one_db_in_one_process_share_one_lock_file(store):

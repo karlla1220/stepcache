@@ -59,7 +59,7 @@ _inherited = []
 
 _LOCK_NAME = re.compile('[0-9a-f]{32}')
 
-_held_locks: dict[int, Path] = {}
+_held_locks: dict[Path, tuple[int, str]] = {}
 _held_locks_guard = threading.Lock()
 
 
@@ -68,7 +68,7 @@ def _drop_inherited_locks():
     # would keep a dead parent's claims looking alive. Closing it leaves the parent's lock held.
     global _held_locks_guard
     _held_locks_guard = threading.Lock()
-    for fd in _held_locks:
+    for fd, _ in _held_locks.values():
         os.close(fd)
     _held_locks.clear()
 
@@ -78,8 +78,8 @@ os.register_at_fork(after_in_child=_drop_inherited_locks)
 
 @atexit.register
 def _remove_held_locks():
-    for path in _held_locks.values():
-        path.unlink(missing_ok=True)
+    for folder, (_, name) in _held_locks.items():
+        (folder / name).unlink(missing_ok=True)
 
 
 class SchemaMismatch(Exception):
@@ -157,9 +157,8 @@ class SqliteStore:
     def __init__(self, path, files):
         self.path = Path(path)
         self.files = Path(files)
-        self._locks = self.path.with_name(f'{self.path.name}.locks')
+        self._locks = self.path.with_name(f'{self.path.name}.locks').resolve()
         self._local = threading.local()
-        self._lock: tuple[int, str] | None = None
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._write() as c:
             version = _schema_version(c, self.path)
@@ -293,7 +292,8 @@ class SqliteStore:
 
         A dead owner's lock file is deleted.
         """
-        if self._lock == (os.getpid(), owner):
+        held = _held_locks.get(self._locks)
+        if held is not None and held[1] == owner:
             return True
         if not _LOCK_NAME.fullmatch(owner):
             return False
@@ -328,15 +328,13 @@ class SqliteStore:
 
     def _lock_name(self) -> str:
         with _held_locks_guard:
-            if self._lock is None or self._lock[0] != os.getpid():
+            if self._locks not in _held_locks:
                 self._locks.mkdir(exist_ok=True)
                 name = secrets.token_hex(16)
-                path = self._locks / name
-                fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+                fd = os.open(self._locks / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
                 fcntl.flock(fd, fcntl.LOCK_EX)
-                _held_locks[fd] = path
-                self._lock = (os.getpid(), name)
-            return self._lock[1]
+                _held_locks[self._locks] = (fd, name)
+            return _held_locks[self._locks][1]
 
     def put_version(self, sha: str, components: dict):
         with self._write() as c:
