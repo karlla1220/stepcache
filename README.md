@@ -10,6 +10,14 @@ byte-identical stop the re-run there: later steps keep their cached results.
 Status: design, no code yet. The design is in [docs/design.md](docs/design.md) and the build order in
 [docs/plan.md](docs/plan.md) (both in Korean).
 
+## Development
+
+Run the tests with [uv](https://docs.astral.sh/uv/):
+
+```
+uv run pytest
+```
+
 ## License
 
 Apache-2.0. See [LICENSE](LICENSE).
