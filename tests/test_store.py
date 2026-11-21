@@ -1,6 +1,11 @@
 import hashlib
 import multiprocessing
+import os
+import signal
 import sqlite3
+import subprocess
+import sys
+import time
 from contextlib import closing
 from datetime import datetime, timezone
 
@@ -137,3 +142,145 @@ def test_opening_a_db_that_is_not_a_stepcache_db_is_refused(tmp_path):
         c.execute('CREATE TABLE notes (body TEXT)')
     with pytest.raises(SchemaMismatch):
         SqliteStore(tmp_path / 'other.db', files=tmp_path / 'blobs')
+
+
+needs_fork = pytest.mark.skipif(not hasattr(os, 'fork'), reason='needs os.fork')
+
+
+def in_another_process(store, expression: str) -> str:
+    code = (
+        'import os, sys; from stepcache import SqliteStore; '
+        f'store = SqliteStore(sys.argv[1], files=sys.argv[2]); print({expression})'
+    )
+    out = subprocess.run([sys.executable, '-c', code, store.path, store.files], capture_output=True, text=True, check=True)
+    return out.stdout.strip()
+
+
+def test_a_claim_has_one_owner_until_the_owner_releases_it(store):
+    assert store.claim('k')
+    assert not store.claim('k')
+    owner = store.claim_owner('k')
+    assert in_another_process(store, '[store.claim("k"), store.release("k"), store.take_over("k", "not the owner")]') == (
+        '[False, None, False]'
+    )
+    assert store.claim_owner('k') == owner
+    store.release('k')
+    assert store.claim_owner('k') is None
+    assert in_another_process(store, 'store.claim("k")') == 'True'
+    assert store.claim_owner('k') != owner
+    assert store.owner_alive(owner)
+
+
+def test_store_objects_on_one_db_in_one_process_share_one_lock_file(store):
+    stores = [SqliteStore(store.path, files=store.files) for _ in range(50)]
+    for i, s in enumerate(stores):
+        assert s.claim(f'k{i}')
+    assert len({store.claim_owner(f'k{i}') for i in range(50)}) == 1
+    assert len(list(store.path.with_name(f'{store.path.name}.locks').iterdir())) == 1
+
+
+def test_an_owner_that_is_not_a_lock_file_name_is_dead_and_its_path_is_left_alone(store):
+    victim = store.path.parent / 'notes.txt'
+    victim.write_text('keep me')
+    store.claim('k')
+    assert not store.owner_alive('../notes.txt')
+    assert victim.read_text() == 'keep me'
+
+
+def claim_and_block(path, files, queue):
+    store = SqliteStore(path, files=files)
+    store.claim('k')
+    queue.put(store.claim_owner('k'))
+    time.sleep(60)
+
+
+def test_a_killed_owner_is_dead_and_one_store_takes_its_claim_over(store):
+    queue = multiprocessing.Queue()
+    proc = multiprocessing.Process(target=claim_and_block, args=(store.path, store.files, queue))
+    proc.start()
+    try:
+        owner = queue.get(timeout=30)
+        assert store.owner_alive(owner)
+        assert not store.claim('k')
+        os.kill(proc.pid, signal.SIGKILL)
+        proc.join()
+        assert not store.owner_alive(owner)
+        assert store.take_over('k', owner)
+        assert not SqliteStore(store.path, files=store.files).take_over('k', owner)
+        assert store.claim_owner('k') != owner
+    finally:
+        proc.kill()
+
+
+def test_a_process_deletes_its_lock_file_when_it_exits(store):
+    locks = store.path.with_name(f'{store.path.name}.locks')
+    code = (
+        'import sys; from stepcache import SqliteStore; '
+        'store = SqliteStore(sys.argv[1], files=sys.argv[2]); store.claim("k"); store.release("k"); '
+        'print(len(list(store.path.with_name(store.path.name + ".locks").iterdir())))'
+    )
+    out = subprocess.run([sys.executable, '-c', code, store.path, store.files], capture_output=True, text=True, check=True)
+    assert out.stdout.strip() == '1'
+    assert list(locks.iterdir()) == []
+
+
+def test_a_process_deletes_the_lock_files_of_dead_processes_when_it_creates_its_own(store):
+    locks = store.path.with_name(f'{store.path.name}.locks')
+    queue = multiprocessing.Queue()
+    live = multiprocessing.Process(target=claim_and_block, args=(store.path, store.files, queue))
+    live.start()
+    try:
+        live_owner = queue.get(timeout=30)
+        for _ in range(2):
+            in_another_process(store, '[store.claim("dead"), store.release("dead"), os._exit(0)]')
+        assert len(list(locks.iterdir())) == 2  # the live file and the last dead one, which swept the first
+        store.claim('mine')
+        assert sorted(p.name for p in locks.iterdir()) == sorted([live_owner, store.claim_owner('mine')])
+    finally:
+        live.kill()
+
+
+@needs_fork
+def test_a_forked_child_claims_under_its_own_lock_file(store):
+    assert store.claim('parent')
+    pid = os.fork()
+    if pid == 0:
+        code = 1
+        try:
+            store.claim('child')
+            code = 0
+        finally:
+            os._exit(code)
+    _, status = os.waitpid(pid, 0)
+    assert os.waitstatus_to_exitcode(status) == 0
+    assert store.claim_owner('child') != store.claim_owner('parent')
+    assert not store.owner_alive(store.claim_owner('child'))
+    assert store.owner_alive(store.claim_owner('parent'))
+
+
+def claim_fork_and_block(path, files, queue):
+    store = SqliteStore(path, files=files)
+    store.claim('k')
+    child = os.fork()
+    if child == 0:
+        time.sleep(60)
+        os._exit(0)
+    queue.put((store.claim_owner('k'), child))
+    time.sleep(60)
+
+
+@needs_fork
+def test_a_forked_child_that_never_uses_the_store_does_not_keep_a_dead_parent_alive(store):
+    queue = multiprocessing.Queue()
+    proc = multiprocessing.Process(target=claim_fork_and_block, args=(store.path, store.files, queue))
+    proc.start()
+    child = None
+    try:
+        owner, child = queue.get(timeout=30)
+        os.kill(proc.pid, signal.SIGKILL)
+        proc.join()
+        assert not store.owner_alive(owner)
+    finally:
+        proc.kill()
+        if child is not None:
+            os.kill(child, signal.SIGKILL)

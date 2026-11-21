@@ -1,13 +1,20 @@
+import asyncio
+import functools
 import gc
 import hashlib
 import json
+import multiprocessing
 import os
+import secrets
+import signal
 import socket
 import sqlite3
 import subprocess
 import sys
 import threading
-from concurrent.futures import ThreadPoolExecutor
+import time
+from collections import Counter
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import closing
 from datetime import datetime, timezone
 from importlib.metadata import version
@@ -15,6 +22,7 @@ from pathlib import Path
 
 import pytest
 
+import stepcache.cache
 from stepcache import Blob, Refused, SqliteStore, Step, StepCache, Version
 
 
@@ -143,7 +151,12 @@ def test_a_refusal_is_stored_and_not_asked_again(cache):
         assert (res.status, res.outputs, res.refusal) == ('refused', {}, Refused('not a figure', {'page': 3}))
 
 
-def test_an_exception_is_not_stored_and_the_next_run_tries_again(cache):
+@pytest.mark.parametrize(
+    'call',
+    [StepCache.run, lambda cache, step, inputs: asyncio.run(cache.async_run(step, inputs))],
+    ids=['run', 'async_run'],
+)
+def test_an_exception_is_not_stored_and_the_next_run_tries_again(cache, call):
     answers = iter([RuntimeError('model timed out'), {'y': 1}])
 
     def answer(inputs):
@@ -155,8 +168,8 @@ def test_an_exception_is_not_stored_and_the_next_run_tries_again(cache):
     run, calls = counted(answer)
     step = Step('s', Version.of(), run)
     with pytest.raises(RuntimeError):
-        cache.run(step, {'x': 1})
-    res = cache.run(step, {'x': 1})
+        call(cache, step, {'x': 1})
+    res = call(cache, step, {'x': 1})
     assert not res.hit and res.outputs == {'y': 1}
     assert len(calls) == 2
 
@@ -178,6 +191,24 @@ def test_a_record_whose_blob_is_gone_is_replaced_by_the_new_answer(cache, store)
     assert third.outputs['alt'].read() == b'answer 2'
 
 
+def test_deleting_a_record_whose_blob_is_gone_keeps_the_record_another_worker_just_stored(cache, store, monkeypatch):
+    step = Step('vlm', Version.of(), lambda inputs: {'alt': Blob(secrets.token_hex(8).encode())})
+    store.delete(cache.run(step, {'x': 1}).outputs['alt'].sha256)
+    other = StepCache(SqliteStore(store.path, files=store.files))
+    has, theirs = store.has, []
+
+    def has_after_another_worker_replaces_the_record(blob_sha):
+        if not theirs:
+            theirs.append(other.run(step, {'x': 1}))
+        return has(blob_sha)
+
+    monkeypatch.setattr(store, 'has', has_after_another_worker_replaces_the_record)
+    mine = cache.run(step, {'x': 1})
+    assert not theirs[0].hit
+    assert mine.result_sha == theirs[0].result_sha
+    assert store.get_record(mine.key).result_sha == theirs[0].result_sha
+
+
 def test_a_json_output_over_4_kib_is_an_error_and_stores_nothing(cache, store):
     fits = 4096 - len('""')  # a JSON string's canonical form adds its two quotes
     png = Blob(b'png')
@@ -192,12 +223,18 @@ def test_a_json_output_over_4_kib_is_an_error_and_stores_nothing(cache, store):
     assert cache.run(step, {'n': fits}).hit
 
 
-def test_run_returns_the_result_another_writer_stored_first(cache):
+def lose_claims(store):
+    with closing(sqlite3.connect(store.path)) as c, c:
+        c.execute('DELETE FROM claims')
+
+
+def test_run_returns_the_result_another_writer_stored_first(cache, store):
     answers = iter(['mine', 'theirs'])
 
     def run(inputs):
         answer = next(answers)
         if answer == 'mine':
+            lose_claims(store)
             cache.run(step, inputs)
         return {'alt': answer}
 
@@ -299,17 +336,364 @@ def test_a_forked_child_keeps_its_result_after_the_parent_closes_the_store(tmp_p
     assert open_cache().run(step, {'x': 2}).hit
 
 
-def test_threads_sharing_a_cache_run_overlapping_inputs(cache):
-    n = 8
-    step = Step('s', Version.of(), lambda inputs: {'png': Blob(f'png {inputs["x"]}'.encode())})
+def open_cache(root) -> StepCache:
+    return StepCache(SqliteStore(Path(root) / 'stepcache.db', files=Path(root) / 'blobs'))
+
+
+def logged(inputs):
+    with open(inputs['log'], 'a') as f:
+        f.write(f'{inputs["x"]}\n')
+    time.sleep(inputs['sleep'])
+    return {'token': secrets.token_hex(8)}
+
+
+LOGGED = Step('logged', Version.of(), logged)
+
+
+def executions(log) -> Counter:
+    return Counter(Path(log).read_text().split())
+
+
+def run_logged(cache, log, xs, sleep) -> dict:
+    return {x: cache.run(LOGGED, {'x': x, 'log': str(log), 'sleep': sleep}).result_sha for x in xs}
+
+
+def rotated(xs: list, i: int) -> list:
+    return xs[i % len(xs):] + xs[:i % len(xs)]
+
+
+def run_logged_in_process(root, barrier, xs, out):
+    stepcache.cache.WAIT_SECONDS = 0.02
+    cache = open_cache(root)
+    barrier.wait()
+    Path(out).write_text(json.dumps(run_logged(cache, Path(root) / 'log', xs, sleep=0.1)))
+
+
+def test_processes_running_the_same_keys_at_once_run_each_key_once(tmp_path):
+    n, xs = 6, list(range(4))
+    barrier = multiprocessing.Barrier(n)
+    procs = [
+        multiprocessing.Process(
+            target=run_logged_in_process, args=(tmp_path, barrier, rotated(xs, i), tmp_path / f'shas-{i}.json')
+        )
+        for i in range(n)
+    ]
+    for p in procs:
+        p.start()
+    for p in procs:
+        p.join(60)
+    assert [p.exitcode for p in procs] == [0] * n
+    assert executions(tmp_path / 'log') == Counter({str(x): 1 for x in xs})
+    shas = [json.loads((tmp_path / f'shas-{i}.json').read_text()) for i in range(n)]
+    assert all(s == shas[0] for s in shas)
+
+
+def test_threads_sharing_a_cache_run_each_key_once(cache, tmp_path, monkeypatch):
+    monkeypatch.setattr('stepcache.cache.WAIT_SECONDS', 0.01)
+    n, xs = 8, list(range(10))
     barrier = threading.Barrier(n)
 
     def worker(i):
         barrier.wait()
-        for x in range(10):
-            cache.run(step, {'x': (x + i) % 10})
+        return run_logged(cache, tmp_path / 'log', rotated(xs, i), sleep=0.01)
 
     with ThreadPoolExecutor(n) as pool:
-        for future in [pool.submit(worker, i) for i in range(n)]:
-            future.result()
-    assert all(cache.run(step, {'x': x}).hit for x in range(10))
+        shas = list(pool.map(worker, range(n)))
+    assert executions(tmp_path / 'log') == Counter({str(x): 1 for x in xs})
+    assert all(s == shas[0] for s in shas)
+
+
+def wait_until(condition, timeout=30):
+    deadline = time.monotonic() + timeout
+    while not condition():
+        assert time.monotonic() < deadline
+        time.sleep(0.01)
+
+
+def in_thread(fn, *args) -> Future:
+    future = Future()
+
+    def target():
+        try:
+            future.set_result(fn(*args))
+        except BaseException as e:
+            future.set_exception(e)
+
+    threading.Thread(target=target, daemon=True).start()
+    return future
+
+
+def blocks_first(inputs):
+    with open(inputs['log'], 'a') as f:
+        f.write('ran\n')
+    if Path(inputs['log']).read_text().count('\n') == 1:
+        time.sleep(60)
+    return {'pid': os.getpid()}
+
+
+BLOCKS_FIRST = Step('blocks_first', Version.of(), blocks_first)
+
+
+def run_blocks_first_in_process(root, started):
+    stepcache.cache.WAIT_SECONDS = 0.02
+    cache = open_cache(root)
+    started.set()
+    cache.run(BLOCKS_FIRST, {'log': str(Path(root) / 'log')})
+
+
+def test_a_waiting_process_takes_over_the_claim_of_a_killed_owner_at_once(tmp_path):
+    log = tmp_path / 'log'
+    owner_started, waiter_started = multiprocessing.Event(), multiprocessing.Event()
+    owner = multiprocessing.Process(target=run_blocks_first_in_process, args=(tmp_path, owner_started))
+    waiter = multiprocessing.Process(target=run_blocks_first_in_process, args=(tmp_path, waiter_started))
+    owner.start()
+    try:
+        wait_until(lambda: log.exists() and log.read_text() == 'ran\n')
+        waiter.start()
+        waiter_started.wait(30)
+        time.sleep(0.3)
+        assert waiter.is_alive()
+        os.kill(owner.pid, signal.SIGKILL)
+        owner.join()
+        waiter.join(5)
+        assert waiter.exitcode == 0
+        res = open_cache(tmp_path).run(BLOCKS_FIRST, {'log': str(log)})
+        assert res.hit and res.outputs == {'pid': waiter.pid}
+    finally:
+        owner.kill()
+        waiter.kill()
+
+
+def test_a_waiting_worker_runs_the_step_itself_when_the_owner_raises(cache, monkeypatch):
+    monkeypatch.setattr('stepcache.cache.WAIT_SECONDS', 0.01)
+    owner_running, waiter_started = threading.Event(), threading.Event()
+    calls = []
+
+    def run(inputs):
+        calls.append(inputs)
+        if len(calls) == 1:
+            owner_running.set()
+            waiter_started.wait(10)
+            time.sleep(0.1)
+            raise RuntimeError('model timed out')
+        return {'y': 1}
+
+    step = Step('s', Version.of(), run)
+    owner = in_thread(cache.run, step, {'x': 1})
+    owner_running.wait(10)
+    waiter_started.set()
+    waiter = in_thread(cache.run, step, {'x': 1})
+    with pytest.raises(RuntimeError):
+        owner.result(10)
+    res = waiter.result(10)
+    assert not res.hit and res.outputs == {'y': 1}
+    assert len(calls) == 2
+
+
+@pytest.mark.parametrize(
+    'call', [StepCache.run, lambda cache, step, inputs: cache.run_many(step, [inputs])[0]], ids=['run', 'run_many']
+)
+def test_an_error_in_the_lookup_right_after_the_claim_releases_the_claim(cache, store, monkeypatch, call):
+    get_record, keys = store.get_record, []
+
+    def get_record_failing_after_the_claim(key):
+        keys.append(key)
+        if len(keys) == 2:  # the first lookup misses, then the key is claimed and looked up again
+            raise sqlite3.OperationalError('disk I/O error')
+        return get_record(key)
+
+    monkeypatch.setattr(store, 'get_record', get_record_failing_after_the_claim)
+    step = Step('s', Version.of(), double)
+    with pytest.raises(sqlite3.OperationalError):
+        call(cache, step, {'x': 1})
+    assert store.claim_owner(keys[1]) is None
+    assert in_thread(call, cache, step, {'x': 1}).result(10).outputs == {'y': 2}
+
+
+def test_ten_async_runs_of_one_key_run_the_step_once_and_leave_the_loop_free(cache, monkeypatch):
+    monkeypatch.setattr('stepcache.cache.WAIT_SECONDS', 0.2)
+    calls = []
+
+    async def run(inputs):
+        calls.append(inputs)
+        await asyncio.sleep(0.5)
+        return {'alt': Blob(b'alt text')}
+
+    step = Step('vlm', Version.of(), run)
+
+    async def main():
+        ticks = []
+
+        async def tick():
+            while True:
+                ticks.append(time.monotonic())
+                await asyncio.sleep(0.01)
+
+        ticker = asyncio.create_task(tick())
+        results = await asyncio.gather(*(cache.async_run(step, {'x': 1}) for _ in range(10)))
+        ticker.cancel()
+        return results, ticks
+
+    results, ticks = in_thread(asyncio.run, main()).result(10)
+    assert len(calls) == 1
+    assert sorted(r.hit for r in results) == [False] + [True] * 9
+    assert len({r.result_sha for r in results}) == 1
+    assert results[0].outputs['alt'].read() == b'alt text'
+    assert max(b - a for a, b in zip(ticks, ticks[1:])) < 0.1
+
+
+async def answer_async(inputs, scale=1):
+    return {'y': inputs['x'] * scale}
+
+
+@pytest.mark.parametrize(
+    'run, y', [(answer_async, 1), (functools.partial(answer_async, scale=2), 2)], ids=['async-def', 'partial']
+)
+def test_run_and_run_many_refuse_an_async_step_and_async_run_awaits_it(cache, run, y):
+    step = Step('s', Version.of(), run)
+    with pytest.raises(TypeError):
+        cache.run(step, {'x': 1})
+    with pytest.raises(TypeError):
+        cache.run_many(step, [{'x': 1}])
+    first = asyncio.run(cache.async_run(step, {'x': 1}))
+    second = asyncio.run(cache.async_run(step, {'x': 1}))
+    assert (first.hit, second.hit) == (False, True)
+    assert first.outputs == second.outputs == {'y': y}
+
+
+def test_async_run_calls_a_sync_step_and_shares_its_records_with_run(cache):
+    run, calls = counted(double)
+    step = Step('s', Version.of(), run)
+    first = asyncio.run(cache.async_run(step, {'x': 2}))
+    second = cache.run(step, {'x': 2})
+    assert (first.hit, second.hit) == (False, True)
+    assert first.outputs == {'y': 4} and first.result_sha == second.result_sha
+    assert len(calls) == 1
+
+
+def test_async_run_awaits_a_cache_false_step_every_time_and_stores_nothing(cache, store):
+    calls = []
+
+    async def run(inputs):
+        calls.append(inputs)
+        return {'outline': Blob(b'outline')}
+
+    step = Step('outline', Version.of(), run, cache=False)
+    results = [asyncio.run(cache.async_run(step, {'x': 1})) for _ in range(2)]
+    assert len(calls) == 2
+    assert [(r.hit, r.key, r.outputs) for r in results] == [(False, None, {'outline': Blob(b'outline')})] * 2
+    assert not store.has(sha(b'outline'))
+
+
+def test_run_many_returns_results_in_order_and_keeps_each_error_in_its_result(cache):
+    err = RuntimeError('model timed out')
+    answers = {1: {'y': 10}, 2: err, 3: Refused('blank page'), 4: {'png': Blob(b'png 4')}}
+    batches = []
+
+    def run_batch(inputs_list):
+        batches.append([inputs['x'] for inputs in inputs_list])
+        return [answers[inputs['x']] for inputs in inputs_list]
+
+    step = Step('s', Version.of(), double, run_batch=run_batch)
+    first = cache.run_many(step, [{'x': x} for x in (1, 2, 3, 4)])
+    assert [r.status for r in first] == ['ok', 'error', 'refused', 'ok']
+    assert first[0].outputs == {'y': 10} and first[3].outputs['png'].read() == b'png 4'
+    assert first[1].error is err and (first[1].outputs, first[1].result_sha) == ({}, None)
+    assert first[2].refusal == Refused('blank page')
+    answers[2] = {'y': 20}
+    second = cache.run_many(step, [{'x': x} for x in (4, 3, 2, 1)])
+    assert batches == [[1, 2, 3, 4], [2]]
+    assert [(r.hit, r.status) for r in second] == [(True, 'ok'), (True, 'refused'), (False, 'ok'), (True, 'ok')]
+    assert second[2].outputs == {'y': 20}
+
+
+def test_run_many_computes_identical_inputs_once(cache):
+    batches = []
+
+    def run_batch(inputs_list):
+        batches.append(inputs_list)
+        return [{'token': secrets.token_hex(8)} for _ in inputs_list]
+
+    step = Step('s', Version.of(), double, run_batch=run_batch)
+    a, b, again = cache.run_many(step, [{'x': 1}, {'x': 2}, {'x': 1}])
+    assert batches == [[{'x': 1}, {'x': 2}]]
+    assert again == a and a.result_sha != b.result_sha
+
+
+def test_when_run_batch_raises_every_miss_it_was_given_gets_the_error(cache):
+    err = RuntimeError('renderer crashed')
+
+    def run_batch(inputs_list):
+        raise err
+
+    step = Step('s', Version.of(), double, run_batch=run_batch)
+    cache.run(step, {'x': 1})
+    results = cache.run_many(step, [{'x': 1}, {'x': 2}, {'x': 3}])
+    assert [(r.hit, r.status, r.error) for r in results] == [(True, 'ok', None), (False, 'error', err), (False, 'error', err)]
+
+
+def test_a_run_batch_that_returns_the_wrong_number_of_items_is_an_error(cache):
+    answers = iter([[{'y': 1}], [{'y': 1}, {'y': 2}]])
+    step = Step('s', Version.of(), double, run_batch=lambda inputs_list: next(answers))
+    with pytest.raises(ValueError):
+        cache.run_many(step, [{'x': 1}, {'x': 2}])
+    results = in_thread(cache.run_many, step, [{'x': 1}, {'x': 2}]).result(10)
+    assert [r.outputs for r in results] == [{'y': 1}, {'y': 2}]
+
+
+def test_run_many_without_run_batch_calls_run_once_per_miss(cache):
+    def answer(inputs):
+        if inputs['x'] == 2:
+            raise RuntimeError('model timed out')
+        return double(inputs)
+
+    run, calls = counted(answer)
+    results = cache.run_many(Step('s', Version.of(), run), [{'x': 1}, {'x': 2}, {'x': 1}])
+    assert calls == [{'x': 1}, {'x': 2}]
+    assert [(r.status, r.outputs) for r in results] == [('ok', {'y': 2}), ('error', {}), ('ok', {'y': 2})]
+    assert isinstance(results[1].error, RuntimeError)
+
+
+def test_run_many_runs_a_cache_false_step_on_every_input_and_stores_nothing(cache, store):
+    batches = []
+
+    def run_batch(inputs_list):
+        batches.append(inputs_list)
+        return [{'outline': Blob(b'outline')}, RuntimeError('bad docx')]
+
+    step = Step('outline', Version.of(), double, run_batch=run_batch, cache=False)
+    results = cache.run_many(step, [{'x': 1}, {'x': 1}])
+    assert batches == [[{'x': 1}, {'x': 1}]]
+    assert [(r.status, r.key) for r in results] == [('ok', None), ('error', None)]
+    assert not store.has(sha(b'outline'))
+
+
+@pytest.mark.parametrize(
+    'holder_raises, runs, hit', [(False, 1, True), (True, 2, False)], ids=['holder-stores', 'holder-raises']
+)
+def test_run_many_waits_after_its_batch_for_a_miss_another_worker_holds(cache, monkeypatch, holder_raises, runs, hit):
+    monkeypatch.setattr('stepcache.cache.WAIT_SECONDS', 0.01)
+    holding, batch_ran = threading.Event(), threading.Event()
+    run_calls, batches = [], []
+
+    def run(inputs):
+        run_calls.append(inputs)
+        if len(run_calls) == 1:
+            holding.set()
+            batch_ran.wait(10)
+            if holder_raises:
+                raise RuntimeError('model timed out')
+        return {'by': 'run'}
+
+    def run_batch(inputs_list):
+        batches.append(inputs_list)
+        batch_ran.set()
+        return [{'by': 'run_batch'} for _ in inputs_list]
+
+    step = Step('s', Version.of(), run, run_batch=run_batch)
+    holder = in_thread(cache.run, step, {'x': 1})
+    holding.wait(10)
+    held, free = in_thread(cache.run_many, step, [{'x': 1}, {'x': 2}]).result(10)
+    assert isinstance(holder.exception(10), RuntimeError) == holder_raises
+    assert batches == [[{'x': 2}]] and free.outputs == {'by': 'run_batch'}
+    assert (held.hit, held.status, held.outputs, len(run_calls)) == (hit, 'ok', {'by': 'run'}, runs)

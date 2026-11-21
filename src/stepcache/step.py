@@ -147,7 +147,8 @@ class Step:
     """A named computation and the version it computes with.
 
     `run(inputs) -> outputs | Refused`, where inputs and outputs map names to a Blob or a
-    JSON value. A `cache=False` step runs every time and stores nothing.
+    JSON value. An `async def` run is called only through `StepCache.async_run`. A
+    `cache=False` step runs every time and stores nothing.
     """
 
     def __init__(self, name: str, version: Version, run, run_batch=None, cache=True):
@@ -158,6 +159,7 @@ class Step:
         self.run = run
         self.run_batch = run_batch
         self.cache = cache
+        self.is_async = inspect.iscoroutinefunction(run)
 
 
 def _code_sha(run, run_batch) -> str:
