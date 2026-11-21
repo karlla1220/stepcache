@@ -62,6 +62,7 @@ class Reason:
 class StepCache:
     def __init__(self, store: SqliteStore):
         self.store = store
+        self._stored_versions = set()
 
     def run(self, step: Step, inputs: dict) -> Result:
         """Return the stored result for these inputs, or run the step and store its result.
@@ -307,8 +308,9 @@ class Subject:
         return res
 
     def _add(self, step: Step, results: list[Result]):
-        if not step.cache:
+        if not step.cache and step.version.sha not in self.cache._stored_versions:
             self.cache.store.put_version(step.version.sha, step.version.components)
+            self.cache._stored_versions.add(step.version.sha)
         with self._lock:
             for res in results:
                 entry = (step.name, step.version.sha, res.key)
