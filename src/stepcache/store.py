@@ -3,6 +3,7 @@ import fcntl
 import hashlib
 import json
 import os
+import re
 import secrets
 import sqlite3
 import threading
@@ -287,6 +288,9 @@ class SqliteStore:
         """
         if self._lock == (os.getpid(), owner):
             return True
+        # Other users may write the database, so an owner is opened only if it is a lock file name.
+        if not re.fullmatch('[0-9a-f]{32}', owner):
+            return False
         path = self._locks / owner
         try:
             fd = os.open(path, os.O_RDONLY)

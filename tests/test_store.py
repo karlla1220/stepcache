@@ -162,6 +162,14 @@ def test_a_claim_has_one_owner_until_the_owner_releases_it(store):
     assert store.owner_alive(owner) and store.owner_alive(other.claim_owner('k'))
 
 
+def test_an_owner_that_is_not_a_lock_file_name_is_dead_and_its_path_is_left_alone(store):
+    victim = store.path.parent / 'notes.txt'
+    victim.write_text('keep me')
+    store.claim('k')
+    assert not store.owner_alive('../notes.txt')
+    assert victim.read_text() == 'keep me'
+
+
 def claim_and_block(path, files, queue):
     store = SqliteStore(path, files=files)
     store.claim('k')
