@@ -205,14 +205,18 @@ def test_a_json_output_over_4_kib_is_an_error_and_stores_nothing(cache, store):
     assert cache.run(step, {'n': fits}).hit
 
 
+def lose_claims(store):
+    with closing(sqlite3.connect(store.path)) as c, c:
+        c.execute('DELETE FROM claims')
+
+
 def test_run_returns_the_result_another_writer_stored_first(cache, store):
     answers = iter(['mine', 'theirs'])
 
     def run(inputs):
         answer = next(answers)
         if answer == 'mine':
-            with closing(sqlite3.connect(store.path)) as c, c:
-                c.execute('DELETE FROM claims')
+            lose_claims(store)
             cache.run(step, inputs)
         return {'alt': answer}
 

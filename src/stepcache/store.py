@@ -57,6 +57,8 @@ _SCHEMA = [
 # Connections inherited across fork. SQLite must not touch them in the child, not even to close.
 _inherited = []
 
+_LOCK_NAME = re.compile('[0-9a-f]{32}')
+
 _held_locks: dict[int, Path] = {}
 _held_locks_guard = threading.Lock()
 
@@ -147,7 +149,9 @@ class SqliteStore:
     `files/<sha[:2]>/<sha[2:]>`. Processes on the same machine may share the store.
 
     A claim names its owner by a lock file in `<db file name>.locks/` that the claiming process
-    holds with `flock` until it exits. An owner whose file is gone or can be locked is dead.
+    holds with `flock` until it exits. An owner whose file is gone or can be locked is dead, and
+    so is an owner that is not a lock file name: the database may be written by other users, so
+    its owner values never become other paths.
     """
 
     def __init__(self, path, files):
@@ -271,7 +275,7 @@ class SqliteStore:
 
     def claim(self, key: str) -> bool:
         """Claim `key` for this process unless it is claimed, and say whether this call claimed it."""
-        owner = self._owner()
+        owner = self._lock_name()
         with self._write() as c:
             return c.execute(
                 'INSERT INTO claims (key, owner) VALUES (?, ?) ON CONFLICT (key) DO NOTHING', (key, owner)
@@ -288,7 +292,7 @@ class SqliteStore:
         """
         if self._lock == (os.getpid(), owner):
             return True
-        if not re.fullmatch('[0-9a-f]{32}', owner):
+        if not _LOCK_NAME.fullmatch(owner):
             return False
         path = self._locks / owner
         try:
@@ -307,7 +311,7 @@ class SqliteStore:
 
     def take_over(self, key: str, dead_owner: str) -> bool:
         """Move the claim on `key` from `dead_owner` to this process, and say whether it moved."""
-        owner = self._owner()
+        owner = self._lock_name()
         with self._write() as c:
             return c.execute(
                 'UPDATE claims SET owner = ? WHERE key = ? AND owner = ?', (owner, key, dead_owner)
@@ -315,11 +319,11 @@ class SqliteStore:
 
     def release(self, key: str):
         """Delete this process's claim on `key`."""
-        owner = self._owner()
+        owner = self._lock_name()
         with self._write() as c:
             c.execute('DELETE FROM claims WHERE key = ? AND owner = ?', (key, owner))
 
-    def _owner(self) -> str:
+    def _lock_name(self) -> str:
         with _held_locks_guard:
             if self._lock is None or self._lock[0] != os.getpid():
                 self._locks.mkdir(exist_ok=True)
