@@ -107,6 +107,49 @@ def test_a_version_is_stored_once(store):
     assert store.get_version('v2') is None
 
 
+def test_a_manifest_replaces_the_previous_manifest_of_its_subject(store, clock):
+    store.put_manifest('A', 'docx 1', [('s', 'v1', 'k1', 'r1'), ('s', 'v1', 'k2', 'r2')])
+    store.put_manifest('B', None, [('s', 'v1', 'k1', 'r1')])
+    clock.now = at(1, 10)
+    store.put_manifest('A', 'docx 2', [('s', 'v2', 'k3', 'r3')])
+    with closing(sqlite3.connect(store.path)) as c:
+        rows = c.execute('SELECT subject, produced_at, source FROM manifests ORDER BY subject').fetchall()
+    assert [(s, datetime.fromisoformat(t), source) for s, t, source in rows] == [
+        ('A', at(1, 10), 'docx 2'), ('B', at(1, 9), None),
+    ]
+    assert store.stale_reasons({'s': 'v2'}, complete=False) == [
+        ('A', 'record', 's', 'k3', None),
+        ('B', 'version', 's', 'v1', None),
+        ('B', 'record', 's', 'k1', None),
+    ]
+
+
+def test_stale_reasons_compare_manifest_entries_with_records_versions_and_the_pipeline(store):
+    store.put_record_if_absent(record('same', 'a'))
+    store.put_record_if_absent(record('other', 'b'))
+    old = {'code': None, 'files': {}, 'tools': {'model': 'm0'}, 'rev': '0'}
+    store.put_version('v0', old)
+    store.put_manifest('A', None, [
+        ('render', 'v1', 'same', sha(b'a')),
+        ('render', 'v1', 'other', sha(b'a')),
+        ('render', 'v1', 'gone', sha(b'a')),
+        ('render', 'v1', 'same', None),
+        ('outline', 'v0', None, None),
+        ('outline', 'v-1', None, None),
+        ('unlisted', 'v0', 'gone', None),
+    ])
+    pipeline = {'outline': 'v1', 'render': 'v1', 'ocr': 'v1'}
+    expected = [
+        ('A', 'version', 'outline', 'v-1', None),
+        ('A', 'version', 'outline', 'v0', old),
+        ('A', 'record', 'render', 'gone', None),
+        ('A', 'record', 'render', 'other', None),
+        ('A', 'record', 'render', 'same', None),
+    ]
+    assert store.stale_reasons(pipeline, complete=False) == expected
+    assert store.stale_reasons(pipeline, complete=True) == expected + [('A', 'missing_step', 'ocr', None, None)]
+
+
 def open_and_put(path, files, barrier, i):
     barrier.wait()
     SqliteStore(path, files=files).put(f'blob {i}'.encode())
