@@ -11,11 +11,15 @@ Status: 0.1.0. The API may still change before 1.0.
 
 ## Install
 
-stepcache is not on PyPI yet. Install it from this repository. This needs `git` on the
-machine, which slim container images such as `python:3.12-slim` do not have.
+```
+pip install stepcache
+```
+
+To install a tagged version from this repository instead, you need `git` on the machine.
+Slim container images such as `python:3.12-slim` do not have it.
 
 ```
-pip install git+https://github.com/karlla1220/stepcache
+pip install git+https://github.com/karlla1220/stepcache@v0.1.0
 ```
 
 stepcache has no dependencies outside the standard library.
