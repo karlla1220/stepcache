@@ -870,6 +870,17 @@ def test_a_subject_that_kept_going_past_a_run_many_error_is_stale_until_processe
     assert cache.stale_subjects([step]) == []
 
 
+def test_a_run_many_error_retried_successfully_in_the_same_block_leaves_the_subject_fresh(cache):
+    answers = {1: {'y': 1}, 2: RuntimeError('model timed out')}
+    step = Step('vlm', Version.of(), double, run_batch=lambda inputs_list: [answers[i['x']] for i in inputs_list])
+    with cache.subject('A') as s:
+        _, failed = s.run_many(step, [{'x': 1}, {'x': 2}])
+        answers[2] = {'y': 2}
+        [retried] = s.run_many(step, [{'x': 2}])
+    assert (failed.status, retried.status) == ('error', 'ok')
+    assert cache.stale_subjects([step]) == []
+
+
 def test_threads_sharing_one_subject_lose_no_entries(cache):
     step = Step('s', Version.of(), double)
     n, per_thread = 8, 6
