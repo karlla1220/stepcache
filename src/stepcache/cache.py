@@ -3,7 +3,7 @@ import time
 from dataclasses import dataclass
 from importlib.metadata import PackageNotFoundError, version
 
-from .step import KEY_FORMAT, Blob, Refused, Step, digest, encode, encode_outputs
+from .step import KEY_FORMAT, Blob, Refused, Step, check_outputs, digest, encode, encode_outputs
 from .store import Record, SqliteStore
 
 try:
@@ -44,7 +44,7 @@ class StepCache:
             out = step.run(inputs)
             if isinstance(out, Refused):
                 return Result(False, 'refused', {}, out, None, None)
-            return Result(False, 'ok', out, None, None, None)
+            return Result(False, 'ok', check_outputs(out), None, None, None)
 
         encoded_inputs = encode(inputs)
         key = digest([KEY_FORMAT, step.name, step.version.sha, encoded_inputs])

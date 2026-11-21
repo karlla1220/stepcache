@@ -45,10 +45,14 @@ def encode(values: dict) -> dict:
     }
 
 
-def encode_outputs(outputs) -> dict:
+def check_outputs(outputs) -> dict:
     if not isinstance(outputs, dict):
         raise TypeError(f'a step returns a dict of outputs or Refused, not {type(outputs).__name__}')
-    for name, v in outputs.items():
+    return outputs
+
+
+def encode_outputs(outputs) -> dict:
+    for name, v in check_outputs(outputs).items():
         if not isinstance(v, Blob) and len(canonical(v)) > JSON_OUTPUT_MAX:
             raise ValueError(f'JSON output {name!r} is over {JSON_OUTPUT_MAX} bytes; return a Blob')
     return encode(outputs)
