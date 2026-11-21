@@ -157,9 +157,11 @@ class SqliteStore:
 
     def _touch(self, table: str, column: str, value: str):
         stamp = _stamp()
+        today = stamp[:10]
         where = f'WHERE {column} = ? AND last_used_at < ?'
-        args = (value, stamp[:10])
-        if self._conn().execute(f'SELECT 1 FROM {table} {where}', args).fetchone():
+        args = (value, today)
+        already_today = not self._conn().execute(f'SELECT 1 FROM {table} {where}', args).fetchone()
+        if not already_today:
             with self._write() as c:
                 c.execute(f'UPDATE {table} SET last_used_at = ? {where}', (stamp, *args))
 

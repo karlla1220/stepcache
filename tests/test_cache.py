@@ -154,7 +154,7 @@ def test_an_exception_is_not_stored_and_the_next_run_tries_again(cache):
     assert len(calls) == 2
 
 
-def test_a_record_whose_blob_is_gone_is_a_miss(cache, store):
+def test_a_record_whose_blob_is_gone_is_replaced_by_the_new_answer(cache, store):
     calls = []
 
     def run(inputs):
@@ -172,16 +172,17 @@ def test_a_record_whose_blob_is_gone_is_a_miss(cache, store):
 
 
 def test_a_json_output_over_4_kib_is_an_error_and_stores_nothing(cache, store):
+    fits = 4096 - len('""')  # a JSON string's canonical form adds its two quotes
     png = Blob(b'png')
     run, calls = counted(lambda inputs: {'png': png, 'alt': 'x' * inputs['n']})
     step = Step('s', Version.of(), run)
     for _ in range(2):
         with pytest.raises(ValueError):
-            cache.run(step, {'n': 4095})
+            cache.run(step, {'n': fits + 1})
     assert len(calls) == 2
     assert not store.has(png.sha256)
-    assert not cache.run(step, {'n': 4094}).hit
-    assert cache.run(step, {'n': 4094}).hit
+    assert not cache.run(step, {'n': fits}).hit
+    assert cache.run(step, {'n': fits}).hit
 
 
 def test_run_returns_the_result_another_writer_stored_first(cache):
