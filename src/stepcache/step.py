@@ -1,5 +1,3 @@
-"""Steps, step versions, blobs, and the canonical encoding that keys are built from."""
-
 import glob
 import hashlib
 import inspect
@@ -15,12 +13,7 @@ JSON_OUTPUT_MAX = 4096
 
 
 def canonical(value) -> bytes:
-    """Encode a JSON value as sorted, compact UTF-8 JSON.
-
-    Accepts only dict with str keys, list, str, int, float, bool and None, and no NaN or
-    infinity. json.dumps would turn a tuple into a list and the key 1 into "1", so two
-    different values could share a key.
-    """
+    # json.dumps would turn a tuple into a list and the key 1 into "1", so two different values could share a key.
     _check_json(value)
     return json.dumps(
         value, sort_keys=True, separators=(',', ':'), ensure_ascii=False, allow_nan=False
@@ -41,12 +34,10 @@ def _check_json(value):
 
 
 def digest(value) -> str:
-    """sha256 hex of the canonical JSON of `value`."""
     return hashlib.sha256(canonical(value)).hexdigest()
 
 
 def encode(values: dict) -> dict:
-    """Tag each value as ['blob', sha] or ['json', value], so a JSON value never matches a blob."""
     return {
         name: ['blob', v.sha256] if isinstance(v, Blob) else ['json', v]
         for name, v in values.items()
@@ -54,7 +45,6 @@ def encode(values: dict) -> dict:
 
 
 def encode_outputs(outputs) -> dict:
-    """Encode a step's outputs, refusing any JSON output over JSON_OUTPUT_MAX bytes."""
     if not isinstance(outputs, dict):
         raise TypeError(f'a step returns a dict of outputs or Refused, not {type(outputs).__name__}')
     for name, v in outputs.items():
@@ -75,7 +65,6 @@ class Blob:
 
     @classmethod
     def _stored(cls, sha256: str, load: Callable[[str], bytes]) -> 'Blob':
-        """A blob whose bytes `load(sha256)` reads when asked."""
         blob = cls.__new__(cls)
         blob.sha256, blob._data, blob._load = sha256, None, load
         return blob

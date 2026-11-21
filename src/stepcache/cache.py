@@ -1,5 +1,3 @@
-"""StepCache: run steps, reusing the stored result of each key."""
-
 import socket
 import time
 from dataclasses import dataclass
@@ -53,7 +51,6 @@ class StepCache:
                 for sha in shas:
                     self.store.touch(sha)
                 return self._result(record, hit=True)
-            # Unusable, and put_record_if_absent would hand it back instead of the new result.
             self.store.delete_record(key)
 
         started = time.monotonic()

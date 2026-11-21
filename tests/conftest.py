@@ -9,8 +9,6 @@ from stepcache import SqliteStore
 
 @pytest.fixture
 def load_module(tmp_path):
-    """Write `source` to a file and import it, so its functions have a source file."""
-
     def load(name, source):
         path = tmp_path / f'{name}.py'
         path.write_text(source)
@@ -29,7 +27,6 @@ def store(tmp_path):
 
 @pytest.fixture
 def clock(monkeypatch):
-    """The store's clock. Set clock.now to move it."""
     clock = SimpleNamespace(now=datetime(2026, 1, 1, 9, tzinfo=timezone.utc))
     monkeypatch.setattr('stepcache.store.now', lambda: clock.now)
     return clock

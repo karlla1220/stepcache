@@ -1,5 +1,3 @@
-"""The SQLite store: records, blobs and step versions in one database and one folder."""
-
 import hashlib
 import json
 import os
@@ -66,7 +64,6 @@ def now() -> datetime:
 
 
 def _stamp() -> str:
-    """Now as fixed-width ISO 8601 UTC, so stamps compare as strings and stamp[:10] is the date."""
     return now().isoformat(timespec='microseconds')
 
 
@@ -162,12 +159,9 @@ class SqliteStore:
         stamp = _stamp()
         where = f'WHERE {column} = ? AND last_used_at < ?'
         args = (value, stamp[:10])
-        # Read first, so a second use on the same day takes no write lock.
         if self._conn().execute(f'SELECT 1 FROM {table} {where}', args).fetchone():
             with self._write() as c:
                 c.execute(f'UPDATE {table} SET last_used_at = ? {where}', (stamp, *args))
-
-    # Records
 
     def get_record(self, key: str) -> Record | None:
         row = self._conn().execute(_SELECT_RECORD, (key,)).fetchone()
@@ -189,8 +183,6 @@ class SqliteStore:
     def touch_record(self, key: str):
         """Mark the record used now, writing at most once per UTC day."""
         self._touch('records', 'key', key)
-
-    # Blobs
 
     def _blob_path(self, sha: str) -> Path:
         return self.files / sha[:2] / sha[2:]
@@ -245,8 +237,6 @@ class SqliteStore:
             c.execute('DELETE FROM blobs WHERE sha = ?', (sha,))
         self._blob_path(sha).unlink(missing_ok=True)
 
-    # Versions
-
     def put_version(self, sha: str, components: dict):
         with self._write() as c:
             c.execute(
@@ -277,7 +267,6 @@ def _use_wal(c: sqlite3.Connection):
 
 
 def _schema_version(c: sqlite3.Connection, path: Path) -> int | None:
-    """The schema version of the database, or None when it is empty."""
     tables = {name for (name,) in c.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
     if not tables:
         return None

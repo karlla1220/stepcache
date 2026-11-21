@@ -21,7 +21,6 @@ def sha(data: bytes) -> str:
 
 
 def spec_digest(value) -> str:
-    """The key hash as the format defines it: sha256 of sorted, compact UTF-8 JSON."""
     text = json.dumps(value, sort_keys=True, separators=(',', ':'), ensure_ascii=False)
     return hashlib.sha256(text.encode()).hexdigest()
 
@@ -31,7 +30,6 @@ def at(day: int, hour: int) -> datetime:
 
 
 def counted(fn):
-    """A step function that calls `fn` and records each call."""
     calls = []
 
     def run(inputs):
@@ -179,7 +177,7 @@ def test_a_json_output_over_4_kib_is_an_error_and_stores_nothing(cache, store):
     step = Step('s', Version.of(), run)
     for _ in range(2):
         with pytest.raises(ValueError):
-            cache.run(step, {'n': 4095})  # '"xxx…"' is 4097 bytes
+            cache.run(step, {'n': 4095})
     assert len(calls) == 2
     assert not store.has(png.sha256)
     assert not cache.run(step, {'n': 4094}).hit
@@ -192,7 +190,7 @@ def test_run_returns_the_result_another_writer_stored_first(cache):
     def run(inputs):
         answer = next(answers)
         if answer == 'mine':
-            cache.run(step, inputs)  # another writer stores the same key while this one computes
+            cache.run(step, inputs)
         return {'alt': answer}
 
     step = Step('vlm', Version.of(), run)
