@@ -191,6 +191,24 @@ def test_a_record_whose_blob_is_gone_is_replaced_by_the_new_answer(cache, store)
     assert third.outputs['alt'].read() == b'answer 2'
 
 
+def test_deleting_a_record_whose_blob_is_gone_keeps_the_record_another_worker_just_stored(cache, store, monkeypatch):
+    step = Step('vlm', Version.of(), lambda inputs: {'alt': Blob(secrets.token_hex(8).encode())})
+    store.delete(cache.run(step, {'x': 1}).outputs['alt'].sha256)
+    other = StepCache(SqliteStore(store.path, files=store.files))
+    has, theirs = store.has, []
+
+    def has_after_another_worker_replaces_the_record(blob_sha):
+        if not theirs:
+            theirs.append(other.run(step, {'x': 1}))
+        return has(blob_sha)
+
+    monkeypatch.setattr(store, 'has', has_after_another_worker_replaces_the_record)
+    mine = cache.run(step, {'x': 1})
+    assert not theirs[0].hit
+    assert mine.result_sha == theirs[0].result_sha
+    assert store.get_record(mine.key).result_sha == theirs[0].result_sha
+
+
 def test_a_json_output_over_4_kib_is_an_error_and_stores_nothing(cache, store):
     fits = 4096 - len('""')  # a JSON string's canonical form adds its two quotes
     png = Blob(b'png')
