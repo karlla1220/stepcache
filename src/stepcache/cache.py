@@ -133,16 +133,11 @@ class StepCache:
         self.store.delete_record(key)
 
     def _record_or_claim(self, key: str):
-        """Return the record of `key` to reuse, or None once this caller holds the claim on `key`.
-
-        Yields once per poll while a live worker holds the claim.
-        """
         held = False
         while True:
             record = self._lookup(key)
             if held:
                 if record is not None:
-                    # The worker that released the claim before this caller took it wrote this record.
                     self.store.release(key)
                 return record
             if record is not None:
@@ -156,7 +151,6 @@ class StepCache:
                 yield
 
     def _lookup(self, key: str) -> Record | None:
-        """The record of `key` if it and all its blobs are stored. A record missing a blob is deleted."""
         record = self.store.get_record(key)
         if record is None:
             return None
@@ -170,7 +164,6 @@ class StepCache:
         return record
 
     def _compute(self, step: Step, key: str, encoded_inputs: dict, inputs: dict) -> Result:
-        """Run the step on a key this caller has claimed, store the result and release the claim."""
         try:
             started = time.monotonic()
             out = step.run(inputs)
@@ -179,7 +172,6 @@ class StepCache:
             self.store.release(key)
 
     def _write(self, step: Step, key: str, encoded_inputs: dict, out, duration_ms: int) -> Result:
-        """Store the step's outputs or refusal for `key`, and return the result the store holds."""
         if isinstance(out, Refused):
             status, outputs, refusal = 'refused', {}, {'reason': out.reason, 'detail': out.detail}
         else:
@@ -243,10 +235,6 @@ async def _async_wait(protocol):
 
 
 def _batch(step: Step, inputs_list: list[dict]) -> list:
-    """Call the step on each inputs dict, in one `run_batch` call or in one `run` call each.
-
-    Returns one output, Refused or exception per inputs dict, in order.
-    """
     if step.run_batch is None or not inputs_list:
         return [_call(step.run, inputs) for inputs in inputs_list]
     try:
@@ -268,7 +256,6 @@ def _call(run, inputs):
 
 
 def _settle(key: str | None, out, finish) -> Result:
-    """`finish(out)`, or an error result when `out` is an exception or `finish` raises one."""
     if not isinstance(out, Exception):
         try:
             return finish(out)

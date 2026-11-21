@@ -288,7 +288,6 @@ class SqliteStore:
         """
         if self._lock == (os.getpid(), owner):
             return True
-        # Other users may write the database, so an owner is opened only if it is a lock file name.
         if not re.fullmatch('[0-9a-f]{32}', owner):
             return False
         path = self._locks / owner
@@ -321,7 +320,6 @@ class SqliteStore:
             c.execute('DELETE FROM claims WHERE key = ? AND owner = ?', (key, owner))
 
     def _owner(self) -> str:
-        """The name of this process's lock file, which the first call creates and locks."""
         with _held_locks_guard:
             if self._lock is None or self._lock[0] != os.getpid():
                 self._locks.mkdir(exist_ok=True)

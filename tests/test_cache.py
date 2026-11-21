@@ -211,7 +211,6 @@ def test_run_returns_the_result_another_writer_stored_first(cache, store):
     def run(inputs):
         answer = next(answers)
         if answer == 'mine':
-            # Lose the claim, as when a waiter judged this worker dead, so the inner run computes.
             with closing(sqlite3.connect(store.path)) as c, c:
                 c.execute('DELETE FROM claims')
             cache.run(step, inputs)
@@ -390,7 +389,6 @@ def wait_until(condition, timeout=30):
 
 
 def in_thread(fn, *args) -> Future:
-    """Run `fn` in a daemon thread, so that a test failing on a hang does not hang the session."""
     future = Future()
 
     def target():
