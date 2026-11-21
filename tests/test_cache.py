@@ -952,6 +952,24 @@ def test_a_failure_and_a_success_of_one_entry_in_the_same_block_leave_the_subjec
     assert cache.stale_subjects([step], complete=True) == []
 
 
+def test_a_thousand_runs_of_a_cache_false_step_in_subjects_store_its_version_once(cache, store):
+    with closing(sqlite3.connect(store.path)) as c:
+        c.executescript(
+            'CREATE TABLE version_writes (version_sha TEXT);'
+            'CREATE TRIGGER count_version_writes BEFORE INSERT ON versions '
+            'BEGIN INSERT INTO version_writes VALUES (NEW.version_sha); END;'
+        )
+    outline = Step('outline', Version.of(), lambda inputs: {'headings': 2}, cache=False)
+    for subject in ('A', 'B'):
+        with cache.subject(subject) as s:
+            for _ in range(500):
+                s.run(outline, {})
+    with closing(sqlite3.connect(store.path)) as c:
+        writes = c.execute('SELECT version_sha FROM version_writes').fetchall()
+    assert writes == [(outline.version.sha,)]
+    assert store.get_version(outline.version.sha) == outline.version.components
+
+
 def test_manifest_reads_back_the_source_and_entries_a_block_recorded(cache):
     step = Step('ocr', Version.of(), double)
     outline = Step('outline', Version.of(), lambda inputs: {'headings': 2}, cache=False)
