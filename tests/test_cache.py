@@ -509,10 +509,12 @@ async def answer_async(inputs, scale=1):
 @pytest.mark.parametrize(
     'run, y', [(answer_async, 1), (functools.partial(answer_async, scale=2), 2)], ids=['async-def', 'partial']
 )
-def test_run_refuses_an_async_step_and_async_run_awaits_it(cache, run, y):
+def test_run_and_run_many_refuse_an_async_step_and_async_run_awaits_it(cache, run, y):
     step = Step('s', Version.of(), run)
     with pytest.raises(TypeError):
         cache.run(step, {'x': 1})
+    with pytest.raises(TypeError):
+        cache.run_many(step, [{'x': 1}])
     first = asyncio.run(cache.async_run(step, {'x': 1}))
     second = asyncio.run(cache.async_run(step, {'x': 1}))
     assert (first.hit, second.hit) == (False, True)
@@ -541,3 +543,117 @@ def test_async_run_awaits_a_cache_false_step_every_time_and_stores_nothing(cache
     assert len(calls) == 2
     assert [(r.hit, r.key, r.outputs) for r in results] == [(False, None, {'outline': Blob(b'outline')})] * 2
     assert not store.has(sha(b'outline'))
+
+
+def test_run_many_returns_results_in_order_and_keeps_each_error_in_its_result(cache):
+    err = RuntimeError('model timed out')
+    answers = {1: {'y': 10}, 2: err, 3: Refused('blank page'), 4: {'png': Blob(b'png 4')}}
+    batches = []
+
+    def run_batch(inputs_list):
+        batches.append([inputs['x'] for inputs in inputs_list])
+        return [answers[inputs['x']] for inputs in inputs_list]
+
+    step = Step('s', Version.of(), double, run_batch=run_batch)
+    first = cache.run_many(step, [{'x': x} for x in (1, 2, 3, 4)])
+    assert [r.status for r in first] == ['ok', 'error', 'refused', 'ok']
+    assert first[0].outputs == {'y': 10} and first[3].outputs['png'].read() == b'png 4'
+    assert first[1].error is err and (first[1].outputs, first[1].result_sha) == ({}, None)
+    assert first[2].refusal == Refused('blank page')
+    answers[2] = {'y': 20}
+    second = cache.run_many(step, [{'x': x} for x in (4, 3, 2, 1)])
+    assert batches == [[1, 2, 3, 4], [2]]
+    assert [(r.hit, r.status) for r in second] == [(True, 'ok'), (True, 'refused'), (False, 'ok'), (True, 'ok')]
+    assert second[2].outputs == {'y': 20}
+
+
+def test_run_many_computes_identical_inputs_once(cache):
+    batches = []
+
+    def run_batch(inputs_list):
+        batches.append(inputs_list)
+        return [{'token': secrets.token_hex(8)} for _ in inputs_list]
+
+    step = Step('s', Version.of(), double, run_batch=run_batch)
+    a, b, again = cache.run_many(step, [{'x': 1}, {'x': 2}, {'x': 1}])
+    assert batches == [[{'x': 1}, {'x': 2}]]
+    assert again == a and a.result_sha != b.result_sha
+
+
+def test_when_run_batch_raises_every_miss_it_was_given_gets_the_error(cache):
+    err = RuntimeError('renderer crashed')
+
+    def run_batch(inputs_list):
+        raise err
+
+    step = Step('s', Version.of(), double, run_batch=run_batch)
+    cache.run(step, {'x': 1})
+    results = cache.run_many(step, [{'x': 1}, {'x': 2}, {'x': 3}])
+    assert [(r.hit, r.status, r.error) for r in results] == [(True, 'ok', None), (False, 'error', err), (False, 'error', err)]
+
+
+def test_a_run_batch_that_returns_the_wrong_number_of_items_is_an_error(cache):
+    answers = iter([[{'y': 1}], [{'y': 1}, {'y': 2}]])
+    step = Step('s', Version.of(), double, run_batch=lambda inputs_list: next(answers))
+    with pytest.raises(ValueError):
+        cache.run_many(step, [{'x': 1}, {'x': 2}])
+    results = in_thread(cache.run_many, step, [{'x': 1}, {'x': 2}]).result(10)
+    assert [r.outputs for r in results] == [{'y': 1}, {'y': 2}]
+
+
+def test_run_many_without_run_batch_calls_run_once_per_miss(cache):
+    def answer(inputs):
+        if inputs['x'] == 2:
+            raise RuntimeError('model timed out')
+        return double(inputs)
+
+    run, calls = counted(answer)
+    results = cache.run_many(Step('s', Version.of(), run), [{'x': 1}, {'x': 2}, {'x': 1}])
+    assert calls == [{'x': 1}, {'x': 2}]
+    assert [(r.status, r.outputs) for r in results] == [('ok', {'y': 2}), ('error', {}), ('ok', {'y': 2})]
+    assert isinstance(results[1].error, RuntimeError)
+
+
+def test_run_many_runs_a_cache_false_step_on_every_input_and_stores_nothing(cache, store):
+    batches = []
+
+    def run_batch(inputs_list):
+        batches.append(inputs_list)
+        return [{'outline': Blob(b'outline')}, RuntimeError('bad docx')]
+
+    step = Step('outline', Version.of(), double, run_batch=run_batch, cache=False)
+    results = cache.run_many(step, [{'x': 1}, {'x': 1}])
+    assert batches == [[{'x': 1}, {'x': 1}]]
+    assert [(r.status, r.key) for r in results] == [('ok', None), ('error', None)]
+    assert not store.has(sha(b'outline'))
+
+
+@pytest.mark.parametrize(
+    'holder_raises, runs, hit', [(False, 1, True), (True, 2, False)], ids=['holder-stores', 'holder-raises']
+)
+def test_run_many_waits_after_its_batch_for_a_miss_another_worker_holds(cache, monkeypatch, holder_raises, runs, hit):
+    monkeypatch.setattr('stepcache.cache.WAIT_SECONDS', 0.01)
+    holding, batch_ran = threading.Event(), threading.Event()
+    run_calls, batches = [], []
+
+    def run(inputs):
+        run_calls.append(inputs)
+        if len(run_calls) == 1:
+            holding.set()
+            batch_ran.wait(10)
+            if holder_raises:
+                raise RuntimeError('model timed out')
+        return {'by': 'run'}
+
+    def run_batch(inputs_list):
+        batches.append(inputs_list)
+        batch_ran.set()
+        return [{'by': 'run_batch'} for _ in inputs_list]
+
+    step = Step('s', Version.of(), run, run_batch=run_batch)
+    holder = in_thread(cache.run, step, {'x': 1})
+    holding.wait(10)
+    held, free = in_thread(cache.run_many, step, [{'x': 1}, {'x': 2}]).result(10)
+    assert isinstance(holder.exception(10), RuntimeError) == holder_raises
+    assert batches == [[{'x': 2}]] and free.outputs == {'by': 'run_batch'}
+    assert (held.hit, held.status, held.outputs, len(run_calls)) == (hit, 'ok', {'by': 'run'}, runs)

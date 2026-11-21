@@ -21,9 +21,10 @@ WAIT_SECONDS = 0.5
 class Result:
     """The result of one run.
 
-    `hit` is False only when this call ran the step. `outputs` maps names to a Blob or a JSON
-    value and is empty when the step refused. A `cache=False` step's result has no `key` and no
-    `result_sha`.
+    `hit` is False only when this call ran the step. `status` is 'ok', 'refused', or, only in a
+    `run_many` result, 'error' with the exception in `error`. `outputs` maps names to a Blob or
+    a JSON value and is empty unless the status is 'ok'. A `cache=False` step's result has no
+    `key`, and only an 'ok' or 'refused' result of a cached step has a `result_sha`.
     """
 
     hit: bool
@@ -32,6 +33,7 @@ class Result:
     refusal: Refused | None
     key: str | None
     result_sha: str | None
+    error: BaseException | None = None
 
 
 class StepCache:
@@ -74,6 +76,57 @@ class StepCache:
             return self._write(step, key, encoded_inputs, out, _ms_since(started))
         finally:
             self.store.release(key)
+
+    def run_many(self, step: Step, inputs_list: list[dict]) -> list[Result]:
+        """Run the step on each inputs dict and return the results in input order.
+
+        Hits are filled at once. The misses this caller claims run in one `run_batch` call, or in
+        one `run` call each when the step has no `run_batch`, and identical inputs run once.
+        Misses that another worker holds are waited for after that. A miss whose step raised, or
+        whose `run_batch` item is an exception, stores nothing and gets an 'error' result.
+        """
+        _check_sync(step)
+        if not step.cache:
+            return [_settle(None, out, _uncached) for out in _batch(step, inputs_list)]
+        keys = []
+        distinct = {}
+        for inputs in inputs_list:
+            key, encoded_inputs = _key(step, inputs)
+            keys.append(key)
+            distinct.setdefault(key, (encoded_inputs, inputs))
+        results, claimed, waiting = {}, [], {}
+        try:
+            for key in distinct:
+                protocol = self._record_or_claim(key)
+                try:
+                    next(protocol)
+                    waiting[key] = protocol
+                except StopIteration as done:
+                    if done.value is None:
+                        claimed.append(key)
+                    else:
+                        results[key] = self._result(done.value, hit=True)
+            if claimed:
+                started = time.monotonic()
+                outs = _batch(step, [distinct[key][1] for key in claimed])
+                duration_ms = round(_ms_since(started) / len(claimed))
+                for key, out in zip(claimed, outs):
+                    results[key] = _settle(
+                        key, out, lambda out: self._write(step, key, distinct[key][0], out, duration_ms)
+                    )
+        finally:
+            for key in claimed:
+                self.store.release(key)
+        for key, protocol in waiting.items():
+            record = _wait(protocol)
+            if record is not None:
+                results[key] = self._result(record, hit=True)
+                continue
+            try:
+                results[key] = self._compute(step, key, *distinct[key])
+            except Exception as e:
+                results[key] = _failed(key, e)
+        return [results[key] for key in keys]
 
     def invalidate(self, step: Step, key: str):
         """Delete the record of `key`, so the next run computes it again."""
@@ -187,6 +240,45 @@ async def _async_wait(protocol):
         except StopIteration as done:
             return done.value
         await asyncio.sleep(WAIT_SECONDS)
+
+
+def _batch(step: Step, inputs_list: list[dict]) -> list:
+    """Call the step on each inputs dict, in one `run_batch` call or in one `run` call each.
+
+    Returns one output, Refused or exception per inputs dict, in order.
+    """
+    if step.run_batch is None or not inputs_list:
+        return [_call(step.run, inputs) for inputs in inputs_list]
+    try:
+        outs = step.run_batch(inputs_list)
+    except Exception as e:
+        return [e] * len(inputs_list)
+    if len(outs) != len(inputs_list):
+        raise ValueError(
+            f'run_batch of step {step.name!r} returned {len(outs)} items for {len(inputs_list)} inputs'
+        )
+    return outs
+
+
+def _call(run, inputs):
+    try:
+        return run(inputs)
+    except Exception as e:
+        return e
+
+
+def _settle(key: str | None, out, finish) -> Result:
+    """`finish(out)`, or an error result when `out` is an exception or `finish` raises one."""
+    if not isinstance(out, Exception):
+        try:
+            return finish(out)
+        except Exception as e:
+            out = e
+    return _failed(key, out)
+
+
+def _failed(key: str | None, error: Exception) -> Result:
+    return Result(False, 'error', {}, None, key, None, error)
 
 
 def _uncached(out) -> Result:
