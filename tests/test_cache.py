@@ -934,7 +934,9 @@ def test_a_run_whose_inputs_have_no_key_is_a_failure_with_no_key(cache):
     'cached, first_fails', [(True, True), (False, True), (False, False)],
     ids=['cached-retried', 'cache-false-retried', 'cache-false-fails-after-a-success'],
 )
-def test_a_failure_and_a_success_of_one_entry_in_the_same_block_leave_the_subject_fresh(cache, cached, first_fails):
+def test_a_failure_and_a_success_of_one_entry_in_the_same_block_leave_the_subject_fresh_only_for_a_cached_step(
+    cache, cached, first_fails
+):
     answers = iter([RuntimeError('model timed out'), {'y': 1}][::1 if first_fails else -1])
 
     def answer(inputs):
@@ -949,7 +951,24 @@ def test_a_failure_and_a_success_of_one_entry_in_the_same_block_leave_the_subjec
             with suppress(RuntimeError):
                 s.run(step, {'x': 1})
     assert next(answers, None) is None
-    assert cache.stale_subjects([step], complete=True) == []
+    expected = [] if cached else [('A', [Reason('failed', 'vlm', {'key': None})])]
+    assert cache.stale_subjects([step], complete=True) == expected
+
+
+@pytest.mark.parametrize(
+    'call',
+    [
+        lambda s, step: s.run_many(step, [{'x': 1}, {'x': -1}]),
+        lambda s, step: [s.run(step, {'x': 1}), s.run(step, {'x': -1})],
+    ],
+    ids=['run_many', 'run'],
+)
+def test_a_cache_false_step_that_fails_for_one_input_and_succeeds_for_another_leaves_the_subject_stale(cache, call):
+    step = Step('outline', Version.of(), lambda inputs: double(inputs) if inputs['x'] > 0 else fail(inputs), cache=False)
+    with cache.subject('A') as s:
+        with suppress(RuntimeError):
+            call(s, step)
+    assert cache.stale_subjects([step]) == [('A', [Reason('failed', 'outline', {'key': None})])]
 
 
 def test_a_thousand_runs_of_a_cache_false_step_in_subjects_store_its_version_once(cache, store):
