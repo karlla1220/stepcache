@@ -160,8 +160,8 @@ class SqliteStore:
         today = stamp[:10]
         where = f'WHERE {column} = ? AND last_used_at < ?'
         args = (value, today)
-        already_today = not self._conn().execute(f'SELECT 1 FROM {table} {where}', args).fetchone()
-        if not already_today:
+        stale = self._conn().execute(f'SELECT 1 FROM {table} {where}', args).fetchone()
+        if stale:
             with self._write() as c:
                 c.execute(f'UPDATE {table} SET last_used_at = ? {where}', (stamp, *args))
 
