@@ -264,8 +264,10 @@ class Subject:
     key or result_sha. A failure is a `run_many` result with status 'error' or a call that raises,
     and is recorded as (None, True). A call that raises records its failure and re-raises. Its key
     is None for a `cache=False` step and for inputs that cannot make a key.
-    Each (step, version_sha, key) is recorded once. A success replaces a failure and a failure
-    never replaces a success, so a failure retried successfully in the block leaves only the success.
+    Each (step, version_sha, key) is recorded once. For a key, a success replaces a failure and a
+    failure never replaces a success, so a failure retried successfully in the block leaves only
+    the success. For the key None it is the other way round, so any failure of a `cache=False`
+    step in the block leaves the subject stale, even when a later run of the step succeeds.
     When the `with` block ends normally, the recorded entries replace the subject's manifest.
     When it raises, the previous manifest stays.
     """
@@ -315,7 +317,8 @@ class Subject:
             for res in results:
                 entry = (step.name, step.version.sha, res.key)
                 failed = res.status == 'error'
-                if not failed or entry not in self._entries:
+                # A None key cannot tell a retry from another input, so its failure sticks.
+                if entry not in self._entries or failed == (res.key is None):
                     self._entries[entry] = (res.result_sha, failed)
 
 
