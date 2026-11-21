@@ -1,3 +1,4 @@
+import functools
 import glob
 import hashlib
 import inspect
@@ -162,8 +163,14 @@ def _code_sha(run, run_batch) -> str:
 
 
 def _source_file(fn) -> str:
+    target = fn
+    while isinstance(target, functools.partial):
+        target = target.func
+    target = inspect.unwrap(target)
+    if not (inspect.isfunction(target) or inspect.ismethod(target) or inspect.isclass(target)):
+        target = type(target)
     try:
-        path = inspect.getsourcefile(inspect.unwrap(fn))
+        path = inspect.getsourcefile(target)
     except (TypeError, OSError):
         path = None
     if path is None or not os.path.isfile(path):
