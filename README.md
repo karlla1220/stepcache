@@ -7,7 +7,7 @@ the step (its code, tools and settings). When a step changes, only the items who
 inputs or step identity changed run again, and items whose output comes out
 byte-identical stop the re-run there: later steps keep their cached results.
 
-Status: 0.1.0. The API may still change before 1.0.
+Status: 0.2.0. The API may still change before 1.0.
 
 ## Install
 
@@ -19,7 +19,7 @@ To install a tagged version from this repository instead, you need `git` on the 
 Slim container images such as `python:3.12-slim` do not have it.
 
 ```
-pip install git+https://github.com/karlla1220/stepcache@v0.1.0
+pip install git+https://github.com/karlla1220/stepcache@v0.2.0
 ```
 
 stepcache has no dependencies outside the standard library.
@@ -82,6 +82,11 @@ with tempfile.TemporaryDirectory() as root:
     # doc:empty [('version', 'render', {'tools': {'added': [], 'removed': [], 'changed': ['renderer']}})]
     # doc:hello [('version', 'render', {'tools': {'added': [], 'removed': [], 'changed': ['renderer']}})]
 
+    # explain says why render_v2 misses, without running it.
+    why = cache.explain(render_v2, {'text': 'hello   world'})
+    print(why.hit, [other['changed'] for other in why.others])
+    # False [{'tools': {'added': [], 'removed': [], 'changed': ['renderer']}}]
+
     # render runs again. Its page has the same bytes, so count is a hit.
     results = process(cache, render_v2, 'doc:hello', 'hello   world')
     print([r.hit for r in results])
@@ -90,6 +95,10 @@ with tempfile.TemporaryDirectory() as root:
     process(cache, render_v2, 'doc:empty', '   ')
     print(cache.stale_subjects(pipeline))
     # []
+
+    # The stored records of each step. A hit stores none.
+    print(cache.stats())
+    # {'count': {'ok': 1, 'refused': 0}, 'render': {'ok': 2, 'refused': 2}}
 ```
 
 ## Keys and versions
@@ -176,6 +185,33 @@ source.
 A step with `cache=False` runs every time and stores no result. A subject still records its
 version, so a change of that version makes the subject stale.
 
+## Why a run would miss
+
+`cache.explain(step, inputs)` says what `run` would find, without running the step or
+changing the store. It returns an `Explanation`:
+
+- `key` is the key that `run` would use.
+- `hit` is `True` when the key has a record and all of the record's blobs are present. `run`
+  uses the same rule.
+- `others` is empty on a hit. On a miss, it lists the records of the same step name and the
+  same inputs under other versions of the step, newest first. Each item is a dict with
+  `version_sha`, `created_at` and `changed`. `created_at` is an ISO 8601 UTC time. `changed`
+  compares that version with the step's version, in the shape of `detail['changed']` in a
+  `version` reason. It is `None` when that version's parts were never stored.
+
+An empty `others` on a miss means that no version of the step has a record for these inputs.
+`explain` checks the inputs as `run` does. It raises `ValueError` for a `cache=False` step,
+because that step has no key.
+
+## Counting stored results
+
+`cache.stats(since=None)` returns the number of stored records of each step by status, such
+as `{'render': {'ok': 2, 'refused': 2}}`. It counts the records in the store, so the counts
+include the records that every process sharing the store wrote. A hit and an error store no
+record, so they do not change the counts. With `since`, an aware `datetime`, only the records
+created at or after that time count. A naive `datetime` raises `ValueError`. A step with no
+records is not in the result.
+
 ## Concurrency
 
 Several processes on one machine can share one cache. `SqliteStore(path, files)` keeps the
@@ -189,6 +225,22 @@ the claiming process holds with `flock`. When that process dies, even by `SIGKIL
 kernel releases the lock. A waiting process checks the owner every half second, sees
 that it is dead, and takes over the claim. stepcache does not release the claim of a process
 that is alive but stuck. Stop that process to release its claim.
+
+## Closing a cache
+
+`cache.close()` calls `store.close()`, which closes every SQLite connection that the store
+object opened in this process, in every thread. After that, every call that uses the store
+raises `ValueError`. Close the cache after the calls in other threads end, because a call
+that runs meanwhile may fail. `StepCache` and `SqliteStore` are context managers, and a `with`
+block closes them on exit:
+
+```python
+with StepCache(SqliteStore('cache/stepcache.db', files='cache/blobs')) as cache:
+    result = cache.run(step, inputs)
+```
+
+Closing does not delete the process's lock file. Other store objects on the same database in
+the process share that file, and the process deletes it when it exits.
 
 ## Supported environments
 

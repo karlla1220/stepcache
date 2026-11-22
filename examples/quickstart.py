@@ -48,6 +48,11 @@ with tempfile.TemporaryDirectory() as root:
     # doc:empty [('version', 'render', {'tools': {'added': [], 'removed': [], 'changed': ['renderer']}})]
     # doc:hello [('version', 'render', {'tools': {'added': [], 'removed': [], 'changed': ['renderer']}})]
 
+    # explain says why render_v2 misses, without running it.
+    why = cache.explain(render_v2, {'text': 'hello   world'})
+    print(why.hit, [other['changed'] for other in why.others])
+    # False [{'tools': {'added': [], 'removed': [], 'changed': ['renderer']}}]
+
     # render runs again. Its page has the same bytes, so count is a hit.
     results = process(cache, render_v2, 'doc:hello', 'hello   world')
     print([r.hit for r in results])
@@ -56,3 +61,7 @@ with tempfile.TemporaryDirectory() as root:
     process(cache, render_v2, 'doc:empty', '   ')
     print(cache.stale_subjects(pipeline))
     # []
+
+    # The stored records of each step. A hit stores none.
+    print(cache.stats())
+    # {'count': {'ok': 1, 'refused': 0}, 'render': {'ok': 2, 'refused': 2}}

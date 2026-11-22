@@ -171,8 +171,9 @@ results = cache.run_many(step, [inputs1, inputs2, ...])
 
 ### 4.6 설명과 통계
 
-- `cache.explain(step, inputs)`는 실행하지 않고 키와 적중 여부를 돌려준다. 미스라면 같은 이름·같은 입력의 다른 버전 레코드를 `input_key`로 찾아, 단계 버전이 어느 구성 요소에서 달라졌는지(`files['cli/main.rs']`, `tools.murex` 등) 보여 준다.
-- 통계: 한 `StepCache`가 단계별로 적중, 미스, 거절, 오류 수를 센다.
+- `cache.explain(step, inputs)`는 단계를 실행하지 않고 저장소도 바꾸지 않는다. `run`이 쓸 키와 적중 여부를 돌려주고, 적중은 `run`과 같은 규칙(레코드가 있고 그 blob이 모두 남아 있다)으로 판단한다. 미스라면 같은 이름·같은 입력의 다른 버전 레코드를 `input_key`로 찾아 최신 것부터 보여 준다. 레코드마다 단계 버전이 어느 구성 요소에서 달라졌는지(`files['cli/main.rs']`, `tools.murex` 등)를 stale 이유 `version`의 `changed`와 같은 모양으로 붙인다. `cache=False` 단계는 키가 없으므로 오류다.
+- 통계: `cache.stats(since=None)`는 단계별로 `'ok'`·`'refused'` 레코드 수를 저장소에서 SQL 한 번으로 센다. 그래서 저장소를 같이 쓰는 모든 프로세스의 레코드가 들어간다. `since`를 주면 그 시각 이후에 만든 레코드만 센다.
+- 한 `StepCache` 안에서 적중·미스·거절·오류 수를 세는 카운터는 만들지 않았다. 프로세스마다 따로 센 수로는 여러 worker가 같이 쓰는 저장소 전체를 볼 수 없다.
 
 ### 4.7 async 실행
 

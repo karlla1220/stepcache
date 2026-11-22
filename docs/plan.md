@@ -13,6 +13,7 @@
   - 정리 `cleanup` (설계 8)
   - 스키마 이주 명령 `stepcache migrate` (결정 16)
   - `PostgresStore` (결정 1)
+- 0.2.0에 넣는 것: 단계별 레코드 수 `stats`, 미스 이유 `explain`(설계 4.6), 저장소를 닫는 `close`와 `with` 블록. 스키마는 바꾸지 않는다.
 
 ## 2. 정한 것
 
