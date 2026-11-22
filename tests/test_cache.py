@@ -1150,3 +1150,14 @@ def test_explain_refuses_a_cache_false_step_and_inputs_that_run_refuses(cache):
         cache.explain(Step('outline', Version.of(), double, cache=False), {'x': 1})
     with pytest.raises(ValueError):
         cache.explain(Step('double', Version.of(), double), {'x': float('nan')})
+
+
+def test_a_cache_in_a_with_block_closes_its_store_on_exit(store):
+    step = Step('double', Version.of(), double)
+    with StepCache(store) as cache:
+        cache.run(step, {'x': 1})
+    assert not store.path.with_name(f'{store.path.name}-wal').exists()
+    for call in (cache.run, cache.explain):
+        with pytest.raises(ValueError):
+            call(step, {'x': 1})
+    assert open_cache(store.path.parent).run(step, {'x': 1}).hit

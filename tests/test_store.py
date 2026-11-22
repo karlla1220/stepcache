@@ -5,7 +5,9 @@ import signal
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from datetime import datetime, timezone
 
@@ -332,3 +334,57 @@ def test_a_forked_child_that_never_uses_the_store_does_not_keep_a_dead_parent_al
         proc.kill()
         if child is not None:
             os.kill(child, signal.SIGKILL)
+
+
+def wal_exists(store) -> bool:
+    # SQLite deletes the WAL file when the last connection to the database closes.
+    return store.path.with_name(f'{store.path.name}-wal').exists()
+
+
+def test_close_closes_the_connections_that_every_thread_opened(store):
+    opened, closed = threading.Barrier(3), threading.Event()
+
+    def use_until_closed():
+        store.get_record('k')
+        opened.wait(30)
+        closed.wait(30)
+        with pytest.raises(ValueError):
+            store.get_record('k')
+
+    with ThreadPoolExecutor(2) as pool:
+        users = [pool.submit(use_until_closed) for _ in range(2)]
+        opened.wait(30)
+        assert wal_exists(store)
+        store.close()
+        assert not wal_exists(store)
+        closed.set()
+        for user in users:
+            user.result()
+
+
+def test_a_closed_store_raises_value_error_and_its_data_stays(store):
+    blob_sha = store.put(b'png')
+    store.close()
+    calls = [lambda: store.get(blob_sha), lambda: store.put(b'png'), lambda: store.claim('k'), store.count_records]
+    for call in calls:
+        with pytest.raises(ValueError):
+            call()
+    store.close()
+    assert SqliteStore(store.path, files=store.files).get(blob_sha) == b'png'
+
+
+def test_a_store_in_a_with_block_closes_on_exit(tmp_path):
+    with SqliteStore(tmp_path / 'stepcache.db', files=tmp_path / 'blobs') as store:
+        blob_sha = store.put(b'png')
+    assert not wal_exists(store)
+    with pytest.raises(ValueError):
+        store.get(blob_sha)
+
+
+def test_closing_a_store_keeps_the_lock_file_that_other_stores_on_the_db_share(store):
+    other = SqliteStore(store.path, files=store.files)
+    assert store.claim('a')
+    owner = store.claim_owner('a')
+    store.close()
+    assert in_another_process(other, f'store.owner_alive({owner!r})') == 'True'
+    assert other.claim('b') and other.claim_owner('b') == owner
