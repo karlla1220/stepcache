@@ -23,7 +23,7 @@ from pathlib import Path
 import pytest
 
 import stepcache.cache
-from stepcache import Blob, Reason, Refused, SqliteStore, Step, StepCache, Subject, Version
+from stepcache import Blob, Explanation, Reason, Refused, SqliteStore, Step, StepCache, Subject, Version
 
 
 @pytest.fixture
@@ -1095,3 +1095,58 @@ def test_stats_since_counts_only_the_records_created_at_or_after_it(cache, clock
     assert cache.stats(since=at(1, 9)) == cache.stats() == every
     with pytest.raises(ValueError):
         cache.stats(since=datetime(2026, 1, 2, 10))
+
+
+def test_explain_on_a_hit_gives_the_key_of_the_stored_record_and_runs_nothing(cache):
+    run, calls = counted(double)
+    step = Step('double', Version.of(), run)
+    res = cache.run(step, {'x': 1})
+    assert cache.explain(step, {'x': 1}) == Explanation(res.key, True, [])
+    assert len(calls) == 1
+
+
+def test_explain_on_a_miss_with_no_other_version_runs_and_stores_nothing(cache):
+    run, calls = counted(double)
+    step = Step('double', Version.of(), run)
+    cache.run(step, {'x': 2})
+    cache.run(Step('triple', Version.of(), run), {'x': 1})
+    why = cache.explain(step, {'x': 1})
+    assert (why.hit, why.others) == (False, [])
+    assert len(calls) == 2
+    res = cache.run(step, {'x': 1})
+    assert not res.hit and res.key == why.key
+
+
+def test_explain_on_a_miss_lists_the_other_versions_newest_first_with_what_changed(cache, store, clock):
+    v1, v2, v3 = (
+        Step('vlm', Version.of(tools={'model': model, 'ocr': ocr}), double)
+        for model, ocr in [('m1', 'o1'), ('m2', 'o1'), ('m2', 'o2')]
+    )
+    cache.run(v1, {'x': 1})
+    clock.now = at(2, 10)
+    cache.run(v2, {'x': 1})
+    cache.run(v3, {'x': 2})
+    why = cache.explain(v3, {'x': 1})
+    assert not why.hit
+    assert [(o['version_sha'], datetime.fromisoformat(o['created_at']), o['changed']) for o in why.others] == [
+        (v2.version.sha, at(2, 10), {'tools': {'added': [], 'removed': [], 'changed': ['ocr']}}),
+        (v1.version.sha, at(1, 9), {'tools': {'added': [], 'removed': [], 'changed': ['model', 'ocr']}}),
+    ]
+    with closing(sqlite3.connect(store.path)) as c, c:
+        c.execute('DELETE FROM versions WHERE version_sha = ?', (v1.version.sha,))
+    assert [o['changed'] for o in cache.explain(v3, {'x': 1}).others] == [why.others[0]['changed'], None]
+
+
+def test_explain_says_miss_for_a_record_whose_blob_is_gone_and_leaves_the_record(cache, store):
+    step = Step('render', Version.of(), lambda inputs: {'png': Blob(b'png'), 'kind': 'figure'})
+    res = cache.run(step, {'x': 1})
+    store.delete(res.outputs['png'].sha256)
+    assert cache.explain(step, {'x': 1}) == Explanation(res.key, False, [])
+    assert store.get_record(res.key) is not None
+
+
+def test_explain_refuses_a_cache_false_step_and_inputs_that_run_refuses(cache):
+    with pytest.raises(ValueError):
+        cache.explain(Step('outline', Version.of(), double, cache=False), {'x': 1})
+    with pytest.raises(ValueError):
+        cache.explain(Step('double', Version.of(), double), {'x': float('nan')})
