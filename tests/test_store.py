@@ -353,11 +353,13 @@ def test_close_closes_the_connections_that_every_thread_opened(store):
 
     with ThreadPoolExecutor(2) as pool:
         users = [pool.submit(use_until_closed) for _ in range(2)]
-        opened.wait(30)
-        assert wal_exists(store)
-        store.close()
-        assert not wal_exists(store)
-        closed.set()
+        try:
+            opened.wait(30)
+            assert wal_exists(store)
+            store.close()
+            assert not wal_exists(store)
+        finally:
+            closed.set()
         for user in users:
             user.result()
 
