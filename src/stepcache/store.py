@@ -214,7 +214,7 @@ class SqliteStore:
         self._locks = self.path.with_name(f'{self.path.name}.locks').resolve()
         self._local = threading.local()
         # Each connection with the pid that opened it, so a forked child closes only its own.
-        # Weak, so a thread's connection is still freed when the thread ends.
+        # Weak, so this list does not keep a finished thread's connection open; the garbage collector frees it.
         self._conns = weakref.WeakKeyDictionary()
         self._closed = False
         self.path.parent.mkdir(parents=True, exist_ok=True)
