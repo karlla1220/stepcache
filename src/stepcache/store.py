@@ -261,6 +261,22 @@ class SqliteStore:
                 'DELETE FROM records WHERE key = ? AND created_at = coalesce(?, created_at)', (key, created_at)
             )
 
+    def count_records(self, since: datetime | None = None) -> dict[str, dict[str, int]]:
+        """Count each step's records by status, only those created at or after `since` when given.
+
+        `since` is an aware datetime. Returns {step: {'ok': n, 'refused': n}} sorted by step, without
+        the steps that have no records.
+        """
+        if since is not None and since.utcoffset() is None:
+            raise ValueError(f'since must be an aware datetime, not {since!r}')
+        start = None if since is None else since.astimezone(timezone.utc).isoformat(timespec='microseconds')
+        rows = self._conn().execute(
+            "SELECT step, sum(status = 'ok'), sum(status = 'refused') FROM records "
+            'WHERE created_at >= coalesce(?, created_at) GROUP BY step ORDER BY step',
+            (start,),
+        ).fetchall()
+        return {step: {'ok': ok, 'refused': refused} for step, ok, refused in rows}
+
     def touch_record(self, key: str):
         """Mark the record used now, writing at most once per UTC day."""
         self._touch('records', 'key', key)

@@ -4,6 +4,7 @@ import threading
 import time
 from contextlib import suppress
 from dataclasses import dataclass
+from datetime import datetime
 from importlib.metadata import PackageNotFoundError, version
 from itertools import groupby
 from operator import itemgetter
@@ -176,6 +177,15 @@ class StepCache:
             (subject, [_reason(steps[name], kind, value, old) for _, kind, name, value, old in group])
             for subject, group in groupby(rows, key=itemgetter(0))
         ]
+
+    def stats(self, since: datetime | None = None) -> dict[str, dict[str, int]]:
+        """Count the stored records of each step: {step: {'ok': n, 'refused': n}}.
+
+        The counts come from the store, so they include the records of every process that shares
+        it. With `since`, an aware datetime, only records created at or after it count. A step with
+        no records is absent.
+        """
+        return self.store.count_records(since)
 
     def _record_or_claim(self, key: str):
         held = False
