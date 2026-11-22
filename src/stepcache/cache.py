@@ -60,6 +60,23 @@ class Reason:
     detail: dict
 
 
+@dataclass(frozen=True)
+class Explanation:
+    """What `run` would find for one step and inputs dict, checked without running the step.
+
+    `key` is the key `run` uses. `hit` says whether its record and all of the record's blobs are
+    present, the rule `run` uses. On a miss, `others` lists the records of the same step name and
+    inputs under other versions, newest first, as {'version_sha', 'created_at', 'changed'}.
+    `created_at` is an ISO 8601 UTC time. `changed` compares that version with the step's version
+    in the shape of a 'version' Reason's `detail['changed']`, and is None when that version's
+    components were never stored. On a hit, `others` is empty.
+    """
+
+    key: str
+    hit: bool
+    others: list
+
+
 class StepCache:
     def __init__(self, store: SqliteStore):
         self.store = store
@@ -178,6 +195,24 @@ class StepCache:
             for subject, group in groupby(rows, key=itemgetter(0))
         ]
 
+    def explain(self, step: Step, inputs: dict) -> Explanation:
+        """Say whether `run` would hit, and on a miss which other versions of the step have a record.
+
+        It runs nothing and changes nothing in the store. Inputs are checked as `run` checks them.
+        A `cache=False` step has no key and raises ValueError.
+        """
+        if not step.cache:
+            raise ValueError(f'step {step.name!r} has cache=False, so it has no key to explain')
+        key, encoded_inputs = _key(step, inputs)
+        record = self.store.get_record(key)
+        if record is not None and all(map(self.store.has, _blob_shas(record))):
+            return Explanation(key, True, [])
+        others = self.store.other_versions(_input_key(step, encoded_inputs), step.version.sha)
+        return Explanation(key, False, [
+            {'version_sha': sha, 'created_at': created_at, 'changed': _changed(old, step.version.components)}
+            for sha, created_at, old in others
+        ])
+
     def stats(self, since: datetime | None = None) -> dict[str, dict[str, int]]:
         """Count the stored records of each step: {step: {'ok': n, 'refused': n}}.
 
@@ -214,7 +249,7 @@ class StepCache:
         record = self.store.get_record(key)
         if record is None:
             return None
-        shas = [sha for kind, sha in record.outputs.values() if kind == 'blob']
+        shas = _blob_shas(record)
         if not all(map(self.store.has, shas)):
             self.store.delete_record(key, record.created_at)
             return None
@@ -253,7 +288,7 @@ class StepCache:
             result_sha=result_sha,
             duration_ms=duration_ms,
             producer=_PRODUCER,
-            input_key=digest([KEY_FORMAT, step.name, encoded_inputs]),
+            input_key=_input_key(step, encoded_inputs),
         ))
         return self._result(record, hit=False)
 
@@ -343,12 +378,14 @@ class Subject:
 
 def _reason(step: Step, kind: str, value: str | None, old: dict | None) -> Reason:
     if kind == 'version':
-        changed = None if old is None else _changed(old, step.version.components)
+        changed = _changed(old, step.version.components)
         return Reason(kind, step.name, {'old': value, 'new': step.version.sha, 'changed': changed})
     return Reason(kind, step.name, {} if kind == 'missing_step' else {'key': value})
 
 
-def _changed(old: dict, new: dict) -> dict:
+def _changed(old: dict | None, new: dict) -> dict | None:
+    if old is None:
+        return None
     changed = {}
     for part in ('code', 'files', 'tools', 'rev'):
         a, b = old[part], new[part]
@@ -368,6 +405,14 @@ def _changed(old: dict, new: dict) -> dict:
 def _key(step: Step, inputs: dict) -> tuple[str, dict]:
     encoded_inputs = encode(inputs)
     return digest([KEY_FORMAT, step.name, step.version.sha, encoded_inputs]), encoded_inputs
+
+
+def _input_key(step: Step, encoded_inputs: dict) -> str:
+    return digest([KEY_FORMAT, step.name, encoded_inputs])
+
+
+def _blob_shas(record: Record) -> list[str]:
+    return [sha for kind, sha in record.outputs.values() if kind == 'blob']
 
 
 def _key_or_none(step: Step, inputs: dict) -> str | None:

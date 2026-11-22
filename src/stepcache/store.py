@@ -416,6 +416,18 @@ class SqliteStore:
         ).fetchone()
         return None if row is None else json.loads(row[0])
 
+    def other_versions(self, input_key: str, version_sha: str) -> list[tuple]:
+        """Return (version_sha, created_at, components) of each record of `input_key` under another
+        version, newest first. `components` is None when `versions` lacks the version.
+        """
+        rows = self._conn().execute(
+            'SELECT r.version_sha, r.created_at, v.components FROM records r '
+            'LEFT JOIN versions v ON v.version_sha = r.version_sha '
+            'WHERE r.input_key = ? AND r.version_sha != ? ORDER BY r.created_at DESC, r.version_sha',
+            (input_key, version_sha),
+        ).fetchall()
+        return [(sha, created_at, None if old is None else json.loads(old)) for sha, created_at, old in rows]
+
     def put_manifest(self, subject: str, source: str | None, entries):
         """Replace the manifest of `subject`. Each entry is (step, version_sha, key, result_sha, failed)."""
         with self._write() as c:
