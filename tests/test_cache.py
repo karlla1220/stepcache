@@ -16,7 +16,7 @@ import time
 from collections import Counter
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import closing, suppress
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from importlib.metadata import version
 from pathlib import Path
 
@@ -1053,3 +1053,45 @@ def test_threads_sharing_one_subject_lose_no_entries(cache):
         cache.invalidate(step, key)
     [(_, reasons)] = cache.stale_subjects([step])
     assert sorted(reason.detail['key'] for reason in reasons) == sorted(keys)
+
+
+def refuse(inputs):
+    return Refused('blank page')
+
+
+def store_records_in_process(root):
+    cache = open_cache(root)
+    for x in (1, 2):
+        cache.run(Step('double', Version.of(), double), {'x': x})
+    cache.run(Step('blank', Version.of(), refuse), {'x': 1})
+
+
+def test_stats_counts_the_records_that_every_process_stored_for_each_step(tmp_path):
+    other = multiprocessing.Process(target=store_records_in_process, args=(tmp_path,))
+    other.start()
+    other.join(60)
+    assert other.exitcode == 0
+    cache = open_cache(tmp_path)
+    doubled = Step('double', Version.of(), double)
+    assert cache.run(doubled, {'x': 1}).hit
+    cache.run(doubled, {'x': 3})
+    with pytest.raises(RuntimeError):
+        cache.run(Step('fails', Version.of(), fail), {})
+    cache.run(Step('outline', Version.of(), double, cache=False), {'x': 1})
+    assert cache.stats() == {'blank': {'ok': 0, 'refused': 1}, 'double': {'ok': 3, 'refused': 0}}
+
+
+def test_stats_since_counts_only_the_records_created_at_or_after_it(cache, clock):
+    step = Step('double', Version.of(), double)
+    cache.run(step, {'x': 1})
+    clock.now = at(2, 10)
+    cache.run(step, {'x': 2})
+    cache.run(Step('blank', Version.of(), refuse), {})
+    later = {'blank': {'ok': 0, 'refused': 1}, 'double': {'ok': 1, 'refused': 0}}
+    assert cache.stats(since=at(2, 10)) == later
+    assert cache.stats(since=at(2, 10).astimezone(timezone(timedelta(hours=9)))) == later
+    assert cache.stats(since=at(2, 10) + timedelta(microseconds=1)) == {}
+    every = {'blank': {'ok': 0, 'refused': 1}, 'double': {'ok': 2, 'refused': 0}}
+    assert cache.stats(since=at(1, 9)) == cache.stats() == every
+    with pytest.raises(ValueError):
+        cache.stats(since=datetime(2026, 1, 2, 10))
