@@ -8,6 +8,7 @@ import secrets
 import sqlite3
 import threading
 import time
+import weakref
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass, fields, replace
 from datetime import datetime, timezone
@@ -63,12 +64,16 @@ _LOCK_NAME = re.compile('[0-9a-f]{32}')
 _held_locks: dict[Path, tuple[int, str]] = {}
 _held_locks_guard = threading.Lock()
 
+# Guards each store's _conns. A module lock, so a forked child gets a new one below.
+_conns_guard = threading.Lock()
+
 
 def _drop_inherited_locks():
     # An inherited descriptor shares the parent's lock, so a child that never touches stepcache
     # would keep a dead parent's claims looking alive. Closing it leaves the parent's lock held.
-    global _held_locks_guard
+    global _held_locks_guard, _conns_guard
     _held_locks_guard = threading.Lock()
+    _conns_guard = threading.Lock()
     for fd, _ in _held_locks.values():
         os.close(fd)
     _held_locks.clear()
@@ -81,6 +86,10 @@ os.register_at_fork(after_in_child=_drop_inherited_locks)
 def _remove_held_locks():
     for folder, (_, name) in _held_locks.items():
         (folder / name).unlink(missing_ok=True)
+
+
+class _Connection(sqlite3.Connection):
+    """A connection that takes weak references, which sqlite3.Connection does not."""
 
 
 class SchemaMismatch(Exception):
@@ -195,6 +204,8 @@ class SqliteStore:
     holds with `flock` until it exits. An owner whose file is gone or can be locked is dead, and
     so is an owner that is not a lock file name: the database may be written by other users, so
     its owner values never become other paths.
+
+    `close` closes the store, and a `with` block closes it on exit.
     """
 
     def __init__(self, path, files):
@@ -202,6 +213,10 @@ class SqliteStore:
         self.files = Path(files)
         self._locks = self.path.with_name(f'{self.path.name}.locks').resolve()
         self._local = threading.local()
+        # Each connection with the pid that opened it, so a forked child closes only its own.
+        # Weak, so this list does not keep a finished thread's connection open; the garbage collector frees it.
+        self._conns = weakref.WeakKeyDictionary()
+        self._closed = False
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._write() as c:
             version = _schema_version(c, self.path)
@@ -213,12 +228,38 @@ class SqliteStore:
         if version != SCHEMA_VERSION:
             raise SchemaMismatch(f'{self.path} has schema version {version}, not {SCHEMA_VERSION}')
 
+    def __enter__(self) -> 'SqliteStore':
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close()
+
+    def close(self):
+        """Close every connection this store object opened in this process, in any thread.
+
+        Every later call that uses the database raises ValueError. Close it after the calls in
+        other threads end, since a call that runs meanwhile may fail. The process's lock file stays,
+        because the other store objects on the database in this process share it.
+        """
+        with _conns_guard:
+            self._closed = True
+            for conn, pid in list(self._conns.items()):
+                if pid == os.getpid():
+                    conn.close()
+
     def _conn(self) -> sqlite3.Connection:
+        if self._closed:
+            raise ValueError(f'the store at {self.path} is closed')
         local = self._local
         if getattr(local, 'pid', None) != os.getpid():
             if hasattr(local, 'conn'):
                 _inherited.append(local.conn)
-            local.conn = sqlite3.connect(self.path, timeout=BUSY_TIMEOUT_SECONDS, isolation_level=None)
+            local.conn = sqlite3.connect(
+                self.path, timeout=BUSY_TIMEOUT_SECONDS, isolation_level=None, check_same_thread=False,
+                factory=_Connection,
+            )
+            with _conns_guard:
+                self._conns[local.conn] = os.getpid()
             _use_wal(local.conn)
             local.conn.execute('PRAGMA synchronous = NORMAL')
             local.pid = os.getpid()
@@ -260,6 +301,22 @@ class SqliteStore:
             c.execute(
                 'DELETE FROM records WHERE key = ? AND created_at = coalesce(?, created_at)', (key, created_at)
             )
+
+    def count_records(self, since: datetime | None = None) -> dict[str, dict[str, int]]:
+        """Count each step's records by status, only those created at or after `since` when given.
+
+        `since` is an aware datetime. Returns {step: {'ok': n, 'refused': n}} sorted by step, without
+        the steps that have no records.
+        """
+        if since is not None and since.utcoffset() is None:
+            raise ValueError(f'since must be an aware datetime, not {since!r}')
+        start = None if since is None else since.astimezone(timezone.utc).isoformat(timespec='microseconds')
+        rows = self._conn().execute(
+            "SELECT step, sum(status = 'ok'), sum(status = 'refused') FROM records "
+            'WHERE created_at >= coalesce(?, created_at) GROUP BY step ORDER BY step',
+            (start,),
+        ).fetchall()
+        return {step: {'ok': ok, 'refused': refused} for step, ok, refused in rows}
 
     def touch_record(self, key: str):
         """Mark the record used now, writing at most once per UTC day."""
@@ -399,6 +456,18 @@ class SqliteStore:
             'SELECT components FROM versions WHERE version_sha = ?', (sha,)
         ).fetchone()
         return None if row is None else json.loads(row[0])
+
+    def other_versions(self, input_key: str, version_sha: str) -> list[tuple]:
+        """Return (version_sha, created_at, components) of each record of `input_key` under another
+        version, newest first. `components` is None when `versions` lacks the version.
+        """
+        rows = self._conn().execute(
+            'SELECT r.version_sha, r.created_at, v.components FROM records r '
+            'LEFT JOIN versions v ON v.version_sha = r.version_sha '
+            'WHERE r.input_key = ? AND r.version_sha != ? ORDER BY r.created_at DESC, r.version_sha',
+            (input_key, version_sha),
+        ).fetchall()
+        return [(sha, created_at, None if old is None else json.loads(old)) for sha, created_at, old in rows]
 
     def put_manifest(self, subject: str, source: str | None, entries):
         """Replace the manifest of `subject`. Each entry is (step, version_sha, key, result_sha, failed)."""
