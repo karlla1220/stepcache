@@ -82,6 +82,16 @@ class StepCache:
         self.store = store
         self._stored_versions = set()
 
+    def __enter__(self) -> 'StepCache':
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close()
+
+    def close(self):
+        """Close the store. See `SqliteStore.close`."""
+        self.store.close()
+
     def run(self, step: Step, inputs: dict) -> Result:
         """Return the stored result for these inputs, or run the step and store its result.
 
