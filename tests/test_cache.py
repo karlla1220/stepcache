@@ -1111,7 +1111,7 @@ def test_explain_on_a_miss_with_no_other_version_runs_and_stores_nothing(cache):
     cache.run(step, {'x': 2})
     cache.run(Step('triple', Version.of(), run), {'x': 1})
     why = cache.explain(step, {'x': 1})
-    assert (why.hit, why.others) == (False, [])
+    assert (why.hit, why.others, why.reason) == (False, [], 'no_record')
     assert len(calls) == 2
     res = cache.run(step, {'x': 1})
     assert not res.hit and res.key == why.key
@@ -1141,7 +1141,7 @@ def test_explain_says_miss_for_a_record_whose_blob_is_gone_and_leaves_the_record
     step = Step('render', Version.of(), lambda inputs: {'png': Blob(b'png'), 'kind': 'figure'})
     res = cache.run(step, {'x': 1})
     store.delete(res.outputs['png'].sha256)
-    assert cache.explain(step, {'x': 1}) == Explanation(res.key, False, [])
+    assert cache.explain(step, {'x': 1}) == Explanation(res.key, False, [], 'blob_gone')
     assert store.get_record(res.key) is not None
 
 
@@ -1161,3 +1161,114 @@ def test_a_cache_in_a_with_block_closes_its_store_on_exit(store):
         with pytest.raises(ValueError):
             call(step, {'x': 1})
     assert open_cache(store.path.parent).run(step, {'x': 1}).hit
+
+
+def drawn(folder: Path):
+    """A step that writes a picture into a served folder and returns its (path, sha256)."""
+    calls = []
+
+    def run(inputs):
+        calls.append(inputs)
+        data = f'svg {inputs["x"]} #{len(calls)}'.encode()
+        path = folder / f'{inputs["x"]}.svg'
+        path.write_bytes(data)
+        return {'svg': {'path': str(path), 'sha256': sha(data)}}
+
+    def valid(outputs):
+        path = Path(outputs['svg']['path'])
+        return path.is_file() and sha(path.read_bytes()) == outputs['svg']['sha256']
+
+    return run, valid, calls
+
+
+def test_valid_does_not_enter_the_key_or_version_and_an_accepted_record_is_a_hit(cache, tmp_path):
+    run, valid, calls = drawn(tmp_path)
+    checked = []
+    step = Step('chart', Version.of(), run, valid=lambda outputs: checked.append(outputs) or valid(outputs))
+    plain = Step('chart', Version.of(), run)
+    assert step.version.sha == plain.version.sha
+    first = cache.run(plain, {'x': 1})
+    second = cache.run(step, {'x': 1})
+    assert second.hit and second.key == first.key
+    assert checked == [first.outputs]
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize('call', [
+    StepCache.run,
+    lambda cache, step, inputs: cache.run_many(step, [inputs])[0],
+    lambda cache, step, inputs: asyncio.run(cache.async_run(step, inputs)),
+], ids=['run', 'run_many', 'async_run'])
+@pytest.mark.parametrize('break_file', [Path.unlink, lambda path: path.write_bytes(b'other')], ids=['gone', 'changed'])
+def test_a_record_that_valid_rejects_is_computed_again_and_replaced(cache, store, tmp_path, call, break_file):
+    run, valid, calls = drawn(tmp_path)
+    step = Step('chart', Version.of(), run, valid=valid)
+    first = call(cache, step, {'x': 1})
+    break_file(tmp_path / '1.svg')
+    second = call(cache, step, {'x': 1})
+    third = call(cache, step, {'x': 1})
+    assert (first.hit, second.hit, third.hit) == (False, False, True)
+    assert len(calls) == 2
+    assert second.result_sha != first.result_sha
+    assert store.get_record(first.key).result_sha == third.result_sha == second.result_sha
+    assert (tmp_path / '1.svg').read_bytes() == b'svg 1 #2'
+
+
+def test_explain_says_invalid_and_leaves_the_record_and_runs_nothing(cache, store, tmp_path):
+    run, valid, calls = drawn(tmp_path)
+    step = Step('chart', Version.of(), run, valid=valid)
+    res = cache.run(step, {'x': 1})
+    assert cache.explain(step, {'x': 1}) == Explanation(res.key, True, [])
+    (tmp_path / '1.svg').unlink()
+    assert cache.explain(step, {'x': 1}) == Explanation(res.key, False, [], 'invalid')
+    assert store.get_record(res.key).result_sha == res.result_sha
+    assert len(calls) == 1 and not (tmp_path / '1.svg').exists()
+
+
+def test_valid_is_not_called_for_a_refusal(cache):
+    run, calls = counted(refuse)
+    step = Step('chart', Version.of(), run, valid=lambda outputs: pytest.fail('valid was called'))
+    cache.run(step, {'x': 1})
+    assert cache.run(step, {'x': 1}).hit and cache.explain(step, {'x': 1}).hit
+    assert len(calls) == 1
+
+
+def test_an_error_in_valid_propagates_keeps_the_record_and_releases_the_claim(cache, store, tmp_path):
+    run, valid, calls = drawn(tmp_path)
+    res = cache.run(Step('chart', Version.of(), run), {'x': 1})
+
+    def broken(outputs):
+        raise PermissionError('served folder is not readable')
+
+    step = Step('chart', Version.of(), run, valid=broken)
+    for call in (StepCache.run, StepCache.explain, lambda cache, step, inputs: cache.run_many(step, [inputs])):
+        with pytest.raises(PermissionError):
+            call(cache, step, {'x': 1})
+    assert store.get_record(res.key).result_sha == res.result_sha
+    assert store.claim_owner(res.key) is None
+    assert len(calls) == 1
+
+
+def test_a_worker_waiting_on_a_rejected_record_gets_the_owners_new_result(cache, tmp_path, monkeypatch):
+    monkeypatch.setattr('stepcache.cache.WAIT_SECONDS', 0.01)
+    draw, valid, calls = drawn(tmp_path)
+    owner_running, waiter_started = threading.Event(), threading.Event()
+
+    def run(inputs):
+        if calls:
+            owner_running.set()
+            waiter_started.wait(10)
+            time.sleep(0.1)
+        return draw(inputs)
+
+    step = Step('chart', Version.of(), run, valid=valid)
+    cache.run(step, {'x': 1})
+    (tmp_path / '1.svg').unlink()
+    owner = in_thread(cache.run, step, {'x': 1})
+    owner_running.wait(10)
+    waiter_started.set()
+    waiter = in_thread(cache.run, step, {'x': 1})
+    mine, theirs = owner.result(10), waiter.result(10)
+    assert (mine.hit, theirs.hit) == (False, True)
+    assert theirs.result_sha == mine.result_sha
+    assert len(calls) == 2
