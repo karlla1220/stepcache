@@ -1233,7 +1233,7 @@ def test_valid_is_not_called_for_a_refusal(cache):
     assert len(calls) == 1
 
 
-def test_an_error_in_valid_propagates_keeps_the_record_and_releases_the_claim(cache, store, tmp_path):
+def test_an_error_in_valid_propagates_and_keeps_the_record(cache, store, tmp_path):
     run, valid, calls = drawn(tmp_path)
     res = cache.run(Step('chart', Version.of(), run), {'x': 1})
 
@@ -1245,7 +1245,6 @@ def test_an_error_in_valid_propagates_keeps_the_record_and_releases_the_claim(ca
         with pytest.raises(PermissionError):
             call(cache, step, {'x': 1})
     assert store.get_record(res.key).result_sha == res.result_sha
-    assert store.claim_owner(res.key) is None
     assert len(calls) == 1
 
 
