@@ -38,6 +38,14 @@ def test_blob_takes_only_bytes(data):
         Blob(data)
 
 
+def test_step_refuses_an_async_valid():
+    async def valid(outputs):
+        return True
+
+    with pytest.raises(TypeError):
+        Step('s', Version.of(), run, valid=valid)
+
+
 def test_step_puts_the_hash_of_the_run_module_in_its_version():
     step = Step('s', Version.of(), run)
     assert step.version.components['code'] == sha(Path(__file__).read_bytes())

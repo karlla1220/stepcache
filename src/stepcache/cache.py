@@ -65,8 +65,10 @@ class Explanation:
     """What `run` would find for one step and inputs dict, checked without running the step.
 
     `key` is the key `run` uses. `hit` says whether its record and all of the record's blobs are
-    present, the rule `run` uses. On a miss, `others` lists the records of the same step name and
-    inputs under other versions, newest first, as {'version_sha', 'created_at', 'changed'}.
+    present and the step's `valid` accepts the record, the rule `run` uses. `reason` is None on a
+    hit, and on a miss 'no_record', 'blob_gone' or 'invalid' (`valid` returned False). On a
+    miss, `others` lists the records of the same step name and inputs under other versions,
+    newest first, as {'version_sha', 'created_at', 'changed'}.
     `created_at` is an ISO 8601 UTC time. `changed` compares that version with the step's version
     in the shape of a 'version' Reason's `detail['changed']`, and is None when that version's
     components were never stored. On a hit, `others` is empty.
@@ -75,6 +77,7 @@ class Explanation:
     key: str
     hit: bool
     others: list
+    reason: str | None = None
 
 
 class StepCache:
@@ -96,14 +99,16 @@ class StepCache:
         """Return the stored result for these inputs, or run the step and store its result.
 
         While another worker computes the same key, this waits for its result. A step that raises
-        stores nothing, and the exception propagates. When another writer stored a result for the
-        key first, that result is returned.
+        stores nothing, and the exception propagates. A stored 'ok' record that the step's `valid`
+        rejects is deleted and computed again. When `valid` raises, the exception propagates and
+        the record stays. When another writer stored a result for the key first, that result is
+        returned.
         """
         _check_sync(step)
         if not step.cache:
             return _uncached(step.run(inputs))
         key, encoded_inputs = _key(step, inputs)
-        record = _wait(self._record_or_claim(key))
+        record = _wait(self._record_or_claim(step, key))
         if record is not None:
             return self._result(record, hit=True)
         return self._compute(step, key, encoded_inputs, inputs)
@@ -117,7 +122,7 @@ class StepCache:
             out = step.run(inputs)
             return _uncached(await out if step.is_async else out)
         key, encoded_inputs = _key(step, inputs)
-        record = await _async_wait(self._record_or_claim(key))
+        record = await _async_wait(self._record_or_claim(step, key))
         if record is not None:
             return self._result(record, hit=True)
         try:
@@ -149,7 +154,7 @@ class StepCache:
         results, claimed, waiting = {}, [], {}
         try:
             for key in distinct:
-                protocol = self._record_or_claim(key)
+                protocol = self._record_or_claim(step, key)
                 try:
                     next(protocol)
                     waiting[key] = protocol
@@ -196,7 +201,9 @@ class StepCache:
         """Return each subject to process again with its reasons, sorted by subject.
 
         Pipeline steps are matched to manifest entries by name, and entries of other steps are
-        ignored. A pipeline step that a manifest lacks is a reason only with `complete`.
+        ignored. A pipeline step that a manifest lacks is a reason only with `complete`. It reads
+        only the store, so it never sees the inputs a step would get now and never calls `valid`;
+        `explain` checks those.
         """
         steps = {step.name: step for step in pipeline}
         rows = self.store.stale_reasons({name: step.version.sha for name, step in steps.items()}, complete)
@@ -208,20 +215,27 @@ class StepCache:
     def explain(self, step: Step, inputs: dict) -> Explanation:
         """Say whether `run` would hit, and on a miss which other versions of the step have a record.
 
-        It runs nothing and changes nothing in the store. Inputs are checked as `run` checks them.
-        A `cache=False` step has no key and raises ValueError.
+        It runs nothing and changes nothing in the store. It calls the step's `valid` as `run`
+        does, and an exception from it propagates. Inputs are checked as `run` checks them. A
+        `cache=False` step has no key and raises ValueError.
         """
         if not step.cache:
             raise ValueError(f'step {step.name!r} has cache=False, so it has no key to explain')
         key, encoded_inputs = _key(step, inputs)
         record = self.store.get_record(key)
-        if record is not None and all(map(self.store.has, _blob_shas(record))):
+        if record is None:
+            reason = 'no_record'
+        elif not all(map(self.store.has, _blob_shas(record))):
+            reason = 'blob_gone'
+        elif not self._valid(step, record):
+            reason = 'invalid'
+        else:
             return Explanation(key, True, [])
         others = self.store.other_versions(_input_key(step, encoded_inputs), step.version.sha)
         return Explanation(key, False, [
             {'version_sha': sha, 'created_at': created_at, 'changed': _changed(old, step.version.components)}
             for sha, created_at, old in others
-        ])
+        ], reason)
 
     def stats(self, since: datetime | None = None) -> dict[str, dict[str, int]]:
         """Count the stored records of each step: {step: {'ok': n, 'refused': n}}.
@@ -232,11 +246,11 @@ class StepCache:
         """
         return self.store.count_records(since)
 
-    def _record_or_claim(self, key: str):
+    def _record_or_claim(self, step: Step, key: str):
         held = False
         while True:
             try:
-                record = self._lookup(key)
+                record = self._lookup(step, key)
             except BaseException:
                 if held:
                     self.store.release(key)
@@ -255,12 +269,12 @@ class StepCache:
             if not held:
                 yield
 
-    def _lookup(self, key: str) -> Record | None:
+    def _lookup(self, step: Step, key: str) -> Record | None:
         record = self.store.get_record(key)
         if record is None:
             return None
         shas = _blob_shas(record)
-        if not all(map(self.store.has, shas)):
+        if not all(map(self.store.has, shas)) or not self._valid(step, record):
             self.store.delete_record(key, record.created_at)
             return None
         self.store.touch_record(key)
@@ -302,13 +316,19 @@ class StepCache:
         ))
         return self._result(record, hit=False)
 
-    def _result(self, record: Record, hit: bool) -> Result:
-        outputs = {
+    def _valid(self, step: Step, record: Record) -> bool:
+        # A refusal names no files, so there is nothing for `valid` to check.
+        return step.valid is None or record.status != 'ok' or step.valid(self._outputs(record))
+
+    def _outputs(self, record: Record) -> dict:
+        return {
             name: Blob._stored(value, self.store.get) if kind == 'blob' else value
             for name, (kind, value) in record.outputs.items()
         }
+
+    def _result(self, record: Record, hit: bool) -> Result:
         refusal = None if record.refusal is None else Refused(**record.refusal)
-        return Result(hit, record.status, outputs, refusal, record.key, record.result_sha)
+        return Result(hit, record.status, self._outputs(record), refusal, record.key, record.result_sha)
 
 
 class Subject:

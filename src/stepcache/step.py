@@ -149,9 +149,17 @@ class Step:
     `run(inputs) -> outputs | Refused`, where inputs and outputs map names to a Blob or a
     JSON value. An `async def` run is called only through `StepCache.async_run`. A
     `cache=False` step runs every time and stores nothing.
+
+    `valid(outputs) -> bool` says whether a stored 'ok' result can still be used, for outputs
+    that name files outside the store. It gets the outputs as a `Result` has them. A record it
+    rejects is a miss. It checks state, not identity, so it is not part of the key or version.
+    It is called synchronously, also from `async_run`, so an `async def` valid raises TypeError.
     """
 
-    def __init__(self, name: str, version: Version, run, run_batch=None, cache=True):
+    def __init__(self, name: str, version: Version, run, run_batch=None, cache=True, valid=None):
+        if inspect.iscoroutinefunction(valid):
+            # A coroutine is always true, so an async valid would accept every record.
+            raise TypeError(f'valid of step {name!r} must be a sync function')
         if version.components['code'] is True:
             version = Version({**version.components, 'code': _code_sha(run, run_batch)})
         self.name = name
@@ -159,6 +167,7 @@ class Step:
         self.run = run
         self.run_batch = run_batch
         self.cache = cache
+        self.valid = valid
         self.is_async = inspect.iscoroutinefunction(run)
 
 
