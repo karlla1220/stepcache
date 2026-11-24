@@ -157,7 +157,8 @@ result can still be used. `run`, `run_many` and `async_run` call it after they f
 whose blobs are all present. When it returns `False`, the record is deleted, as a record
 whose blob is gone is, and the step runs again. When it raises, the exception propagates
 from `run`, `run_many` or `async_run`, the record stays and nothing is stored. `valid` is not
-called for a refusal, because a refusal has no outputs to check.
+called for a refusal, because a refusal has no outputs to check. `valid` must be a sync function,
+also for an async step, and `Step` raises `TypeError` for an `async def` one.
 
 `valid` checks the state of the files, not what the step computes. It is not part of the key
 or the version, so adding, changing or removing it keeps every key of the step.
