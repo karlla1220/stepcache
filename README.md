@@ -7,7 +7,7 @@ the step (its code, tools and settings). When a step changes, only the items who
 inputs or step identity changed run again, and items whose output comes out
 byte-identical stop the re-run there: later steps keep their cached results.
 
-Status: 0.2.0. The API may still change before 1.0.
+Status: 0.2.1. The API may still change before 1.0.
 
 ## Install
 
@@ -19,7 +19,7 @@ To install a tagged version from this repository instead, you need `git` on the 
 Slim container images such as `python:3.12-slim` do not have it.
 
 ```
-pip install git+https://github.com/karlla1220/stepcache@v0.2.0
+pip install git+https://github.com/karlla1220/stepcache@v0.2.1
 ```
 
 stepcache has no dependencies outside the standard library.
@@ -103,7 +103,7 @@ with tempfile.TemporaryDirectory() as root:
 
 ## Keys and versions
 
-`Step(name, version, run, run_batch=None, cache=True)` has a name, a `Version` and a `run`
+`Step(name, version, run, run_batch=None, cache=True, valid=None)` has a name, a `Version` and a `run`
 function. `run` takes a dict of inputs and returns a dict of outputs or a `Refused`. Each
 input and output value is a `Blob` or a JSON value. A JSON output can be at most 4096
 bytes, so return longer data as a `Blob`. A longer one makes `StepCache.run` raise
@@ -137,6 +137,30 @@ input will always get the same answer. The cache stores a refusal like a result,
 `Result` has `status == 'refused'` and the refusal in `refusal`. `StepCache.run` does not
 raise for a refusal. A step raises an exception for an error. The cache stores nothing, the
 exception propagates, and the next run tries again.
+
+## Outputs that name files
+
+A step can keep a file outside the store, such as a picture in a folder that a server
+serves, and return its path and sha256 as a JSON output. When that file is deleted or
+changed, the record is still there and would still be a hit. Pass `valid` to catch that:
+
+```python
+def drawn(outputs):
+    path = Path(outputs['svg']['path'])
+    return path.is_file() and sha256(path.read_bytes()).hexdigest() == outputs['svg']['sha256']
+
+chart = Step('chart', Version.of(), draw, valid=drawn)
+```
+
+`valid(outputs)` gets the outputs as a `Result` has them and returns whether the stored
+result can still be used. `run`, `run_many` and `async_run` call it after they find a record
+whose blobs are all present. When it returns `False`, the record is deleted, as a record
+whose blob is gone is, and the step runs again. When it raises, the exception propagates
+from `run`, `run_many` or `async_run`, the record stays and nothing is stored. `valid` is not
+called for a refusal, because a refusal has no outputs to check.
+
+`valid` checks the state of the files, not what the step computes. It is not part of the key
+or the version, so adding, changing or removing it keeps every key of the step.
 
 ## `run_many` and `async_run`
 
@@ -185,14 +209,26 @@ source.
 A step with `cache=False` runs every time and stores no result. A subject still records its
 version, so a change of that version makes the subject stale.
 
+`stale_subjects` reads only the manifests and records in the store. It does not know the
+inputs that a step would get now, and it never calls `valid`. To find every subject to process
+again, use both checks:
+
+- `cache.stale_subjects(pipeline)` finds changed step versions, failures and records that are
+  gone.
+- `cache.explain(step, inputs)`, with the inputs that the subject would give each step now,
+  finds changed inputs and records that `valid` rejects. It computes the key and runs
+  nothing.
+
 ## Why a run would miss
 
 `cache.explain(step, inputs)` says what `run` would find, without running the step or
 changing the store. It returns an `Explanation`:
 
 - `key` is the key that `run` would use.
-- `hit` is `True` when the key has a record and all of the record's blobs are present. `run`
-  uses the same rule.
+- `hit` is `True` when the key has a record, all of the record's blobs are present and the
+  step's `valid`, if it has one, accepts the record. `run` uses the same rule.
+- `reason` is `None` on a hit. On a miss it is `'no_record'`, `'blob_gone'`, or `'invalid'`
+  when `valid` returned `False`.
 - `others` is empty on a hit. On a miss, it lists the records of the same step name and the
   same inputs under other versions of the step, newest first. Each item is a dict with
   `version_sha`, `created_at` and `changed`. `created_at` is an ISO 8601 UTC time. `changed`
@@ -200,8 +236,9 @@ changing the store. It returns an `Explanation`:
   `version` reason. It is `None` when that version's parts were never stored.
 
 An empty `others` on a miss means that no version of the step has a record for these inputs.
-`explain` checks the inputs as `run` does. It raises `ValueError` for a `cache=False` step,
-because that step has no key.
+`explain` calls `valid` but never deletes a record that it rejects; the next `run` does that.
+An exception from `valid` propagates. `explain` checks the inputs as `run` does. It raises
+`ValueError` for a `cache=False` step, because that step has no key.
 
 ## Counting stored results
 
